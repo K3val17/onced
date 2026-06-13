@@ -108,9 +108,82 @@ impl SlidingWindowLimiter {
     }
 }
 
+/// What to do when a rule's budget is exceeded. The engine only *classifies*;
+/// how to act (return an error, add latency, drop the request) is the caller's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    /// Make the caller prove itself (e.g. a CAPTCHA or step-up auth).
+    Challenge,
+    /// Deliberately slow the caller down.
+    Throttle,
+    /// Reject outright.
+    Block,
+}
+
+/// The outcome of evaluating a [`RuleSet`] for one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// No rule tripped.
+    Allow,
+    /// A rule tripped: `rule` names it, `action` is what to do.
+    Deny { rule: String, action: Action },
+}
+
+/// One named limit and the action to take when it is exceeded.
+struct Rule {
+    name: String,
+    limiter: SlidingWindowLimiter,
+    action: Action,
+}
+
+/// An ordered set of rate-limit rules evaluated together over the same key.
+/// Every rule is recorded on each request (so each dimension stays accurate),
+/// and the first rule to trip — in insertion order — decides the verdict.
+pub struct RuleSet {
+    rules: Vec<Rule>,
+}
+
+impl RuleSet {
+    /// An empty rule set (allows everything).
+    pub fn new() -> Self {
+        Self { rules: Vec::new() }
+    }
+
+    /// Add a rule: up to `limit` hits per trailing `window_ms`, else `action`.
+    pub fn rule(mut self, name: &str, window_ms: u64, limit: u64, action: Action) -> Self {
+        self.rules.push(Rule {
+            name: name.to_string(),
+            limiter: SlidingWindowLimiter::new(window_ms, limit),
+            action,
+        });
+        self
+    }
+
+    /// Record this request against every rule and return the verdict.
+    pub fn evaluate(&mut self, key: &str, now_ms: u64) -> Verdict {
+        let mut verdict = Verdict::Allow;
+        for rule in &mut self.rules {
+            let denied = matches!(rule.limiter.check(key, now_ms), Decision::Deny);
+            if denied && verdict == Verdict::Allow {
+                verdict = Verdict::Deny {
+                    rule: rule.name.clone(),
+                    action: rule.action,
+                };
+            }
+        }
+        verdict
+    }
+}
+
+impl Default for RuleSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::abuse::{Decision, SlidingWindowLimiter};
+    use crate::abuse::{Action, Decision, RuleSet, SlidingWindowLimiter, Verdict};
 
     /// Up to and including the limit is allowed; the next request is denied.
     #[test]
@@ -170,5 +243,57 @@ mod tests {
             }
         }
         assert_eq!(allowed, 5);
+    }
+
+    #[test]
+    fn rules_allow_when_every_rule_passes() {
+        let mut rules = RuleSet::new()
+            .rule("per-second", 1000, 100, Action::Throttle)
+            .rule("per-minute", 60_000, 1000, Action::Block);
+        assert_eq!(rules.evaluate("ip-1", 0), Verdict::Allow);
+    }
+
+    #[test]
+    fn rules_deny_with_the_tripped_rules_action() {
+        let mut rules = RuleSet::new().rule("strict", 1000, 2, Action::Block);
+        assert_eq!(rules.evaluate("ip-1", 0), Verdict::Allow);
+        assert_eq!(rules.evaluate("ip-1", 0), Verdict::Allow);
+        assert_eq!(
+            rules.evaluate("ip-1", 0),
+            Verdict::Deny {
+                rule: "strict".into(),
+                action: Action::Block,
+            }
+        );
+    }
+
+    #[test]
+    fn rules_first_tripped_in_order_wins() {
+        let mut rules = RuleSet::new()
+            .rule("loose-throttle", 1000, 100, Action::Throttle)
+            .rule("strict-block", 1000, 2, Action::Block);
+        rules.evaluate("ip-1", 0);
+        rules.evaluate("ip-1", 0);
+        assert_eq!(
+            rules.evaluate("ip-1", 0),
+            Verdict::Deny {
+                rule: "strict-block".into(),
+                action: Action::Block,
+            }
+        );
+    }
+
+    #[test]
+    fn rules_keep_keys_independent() {
+        let mut rules = RuleSet::new().rule("strict", 1000, 1, Action::Challenge);
+        assert_eq!(rules.evaluate("a", 0), Verdict::Allow);
+        assert_eq!(
+            rules.evaluate("a", 0),
+            Verdict::Deny {
+                rule: "strict".into(),
+                action: Action::Challenge,
+            }
+        );
+        assert_eq!(rules.evaluate("b", 0), Verdict::Allow);
     }
 }
