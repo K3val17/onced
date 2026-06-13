@@ -18,6 +18,9 @@
 
 #![forbid(unsafe_code)]
 
+pub mod engine;
+pub mod store;
+
 use std::collections::BTreeMap;
 
 /// A client-supplied idempotency key — e.g. the value of an `Idempotency-Key`
@@ -69,6 +72,9 @@ pub enum KeyState {
         fence: Fence,
         /// Binds this key to the specific request that started it.
         fingerprint: RequestFingerprint,
+        /// Injected wall-clock millis after which the lease is presumed dead and
+        /// a retry may take over the key with a fresh fence.
+        lease_expires_at_ms: u64,
     },
     /// The side effect ran exactly once; `outcome` is replayed to all retries.
     Completed {
@@ -92,6 +98,7 @@ mod tests {
         let in_progress = KeyState::InProgress {
             fence: Fence(1),
             fingerprint,
+            lease_expires_at_ms: 31_000,
         };
         let completed = KeyState::Completed {
             fingerprint,
