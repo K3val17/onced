@@ -20,6 +20,7 @@
 
 pub mod abuse;
 pub mod engine;
+pub mod hll;
 pub mod sketch;
 pub mod store;
 pub mod wal;
