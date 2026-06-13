@@ -20,6 +20,7 @@
 
 pub mod engine;
 pub mod store;
+pub mod wal;
 
 use std::collections::BTreeMap;
 

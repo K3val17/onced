@@ -19,6 +19,14 @@ pub trait Store {
 
     /// Insert or overwrite the state of `key`.
     fn put(&mut self, key: IdempotencyKey, state: KeyState);
+
+    /// Highest fence currently recorded among in-progress keys (0 if none).
+    /// After recovery the engine seeds its fence counter above this, so a freshly
+    /// minted fence never collides with one a live worker might still hold.
+    /// Stores that are always constructed empty may use this default.
+    fn max_in_progress_fence(&self) -> u64 {
+        0
+    }
 }
 
 /// An in-memory [`Store`] for tests and development.

@@ -59,10 +59,14 @@ pub enum CompleteError {
 impl<S: Store> Engine<S> {
     /// Create an engine over `store`, with a per-key lease of `lease_ms`.
     pub fn new(store: S, lease_ms: u64) -> Self {
+        // Seed the fence counter above anything recovered from a durable store,
+        // so a freshly minted fence never collides with a fence a live worker
+        // might still hold after a crash. A fresh/empty store yields 1.
+        let next_fence = store.max_in_progress_fence() + 1;
         Self {
             store,
             lease_ms,
-            next_fence: 1,
+            next_fence,
         }
     }
 
