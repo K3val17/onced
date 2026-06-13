@@ -1,0 +1,10 @@
+[package]
+name = "onced-core"
+version = "0.0.0"
+description = "Exactly-once effect and abuse-defense core engine: pure, deterministic, storage- and runtime-agnostic."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+
+[dev-dependencies]

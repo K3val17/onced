@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/onced-core"]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.77"
+
+# Quality / performance defaults for shipped binaries.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
