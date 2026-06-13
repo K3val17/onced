@@ -18,6 +18,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod abuse;
 pub mod engine;
 pub mod store;
 pub mod wal;
