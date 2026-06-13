@@ -427,4 +427,93 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    /// Differential stress test: drive the WAL with hundreds of random writes
+    /// and repeated simulated crashes, asserting the durably-recovered state
+    /// always matches a plain in-memory reference model. Deterministic seed, so
+    /// any failure reproduces exactly — the seed of the Phase 5 DST approach.
+    #[test]
+    fn randomized_writes_recover_exactly_across_crashes() {
+        use std::collections::HashMap;
+
+        struct Rng(u64);
+        impl Rng {
+            fn next_u64(&mut self) -> u64 {
+                // xorshift64: full-period, dependency-free, reproducible.
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, n: u64) -> u64 {
+                self.next_u64() % n
+            }
+        }
+
+        fn random_fingerprint(rng: &mut Rng) -> RequestFingerprint {
+            let mut bytes = [0u8; 32];
+            for b in bytes.iter_mut() {
+                *b = rng.below(256) as u8;
+            }
+            RequestFingerprint(bytes)
+        }
+
+        fn random_state(rng: &mut Rng) -> KeyState {
+            if rng.below(2) == 0 {
+                KeyState::InProgress {
+                    fence: Fence(rng.next_u64()),
+                    fingerprint: random_fingerprint(rng),
+                    lease_expires_at_ms: rng.next_u64(),
+                }
+            } else {
+                let body_len = rng.below(8) as usize;
+                let body: Vec<u8> = (0..body_len).map(|_| rng.below(256) as u8).collect();
+                let mut headers = BTreeMap::new();
+                if rng.below(2) == 0 {
+                    headers.insert("x-test".to_string(), format!("v{}", rng.below(1000)));
+                }
+                KeyState::Completed {
+                    fingerprint: random_fingerprint(rng),
+                    outcome: CachedOutcome {
+                        status: 200 + rng.below(50) as u16,
+                        headers,
+                        body,
+                    },
+                }
+            }
+        }
+
+        let path = temp_wal_path("randomized");
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut reference: HashMap<IdempotencyKey, KeyState> = HashMap::new();
+        let mut store = WalStore::open(&path).unwrap();
+
+        for i in 0..600u32 {
+            // Small key space so the same key is overwritten many times.
+            let key = IdempotencyKey(format!("k{}", rng.below(16)));
+            let state = random_state(&mut rng);
+            reference.insert(key.clone(), state.clone());
+            store.put(key, state);
+
+            // Periodically "crash": drop the store and recover from disk.
+            if i % 50 == 49 {
+                drop(store);
+                store = WalStore::open(&path).unwrap();
+                for (k, v) in &reference {
+                    assert_eq!(store.get(k), Some(v), "divergence after reopen at op {i}");
+                }
+            }
+        }
+
+        // Final crash + full recovery must equal the reference exactly.
+        drop(store);
+        let store = WalStore::open(&path).unwrap();
+        for (k, v) in &reference {
+            assert_eq!(store.get(k), Some(v));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
