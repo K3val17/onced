@@ -133,9 +133,89 @@ fn invalid(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+/// Serialize `request` to `writer` to forward it to a backend. Sets
+/// `Content-Length` to the actual body length and `Connection: close` (one
+/// request per connection), overriding any caller-supplied versions.
+pub fn write_request<W: Write>(writer: &mut W, request: &Request) -> std::io::Result<()> {
+    write!(writer, "{} {} HTTP/1.1\r\n", request.method, request.target)?;
+    for (name, value) in &request.headers {
+        if name.eq_ignore_ascii_case("content-length") || name.eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        write!(writer, "{name}: {value}\r\n")?;
+    }
+    write!(writer, "Content-Length: {}\r\n", request.body.len())?;
+    writer.write_all(b"Connection: close\r\n")?;
+    writer.write_all(b"\r\n")?;
+    writer.write_all(&request.body)?;
+    Ok(())
+}
+
+/// Parse a response from a backend. The body length comes from `Content-Length`
+/// if present, otherwise it is read to EOF (the `Connection: close` convention).
+pub fn parse_response<R: BufRead>(reader: &mut R) -> std::io::Result<Response> {
+    let mut status_line = String::new();
+    if reader.read_line(&mut status_line)? == 0 {
+        return Err(invalid("empty response"));
+    }
+    let trimmed = status_line.trim_end_matches(['\r', '\n']);
+    let mut parts = trimmed.splitn(3, ' ');
+    let _version = parts.next();
+    let status: u16 = parts
+        .next()
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| invalid("bad status line"))?;
+
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        match line.split_once(':') {
+            Some((name, value)) => {
+                headers.push((name.trim().to_string(), value.trim().to_string()))
+            }
+            None => return Err(invalid("malformed response header")),
+        }
+    }
+
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok());
+
+    let body = match content_length {
+        Some(length) => {
+            let mut body = vec![0u8; length];
+            if length > 0 {
+                reader.read_exact(&mut body)?;
+            }
+            body
+        }
+        None => {
+            let mut body = Vec::new();
+            reader.read_to_end(&mut body)?;
+            body
+        }
+    };
+
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::http::{parse_request, write_response, Response};
+    use crate::http::{
+        parse_request, parse_response, write_request, write_response, Request, Response,
+    };
     use std::io::Cursor;
 
     #[test]
@@ -187,5 +267,69 @@ mod tests {
         assert!(text.contains("Content-Length: 7\r\n"), "got: {text:?}");
         assert!(text.contains("X-Test: 1\r\n"), "got: {text:?}");
         assert!(text.ends_with("\r\n\r\ncreated"), "got: {text:?}");
+    }
+
+    #[test]
+    fn write_request_then_parse_request_round_trips() {
+        let request = Request {
+            method: "POST".into(),
+            target: "/charge".into(),
+            headers: vec![
+                ("Idempotency-Key".into(), "k1".into()),
+                ("Host".into(), "backend".into()),
+            ],
+            body: b"amount=100".to_vec(),
+        };
+        let mut buf = Vec::new();
+        write_request(&mut buf, &request).unwrap();
+
+        let mut reader = Cursor::new(buf);
+        let parsed = parse_request(&mut reader).unwrap().expect("a request");
+        assert_eq!(parsed.method, "POST");
+        assert_eq!(parsed.target, "/charge");
+        assert_eq!(parsed.body, b"amount=100");
+        assert_eq!(parsed.header("idempotency-key"), Some("k1"));
+    }
+
+    #[test]
+    fn parse_response_reads_status_headers_and_body() {
+        let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nX-Test: 1\r\n\r\ncharged";
+        let mut reader = Cursor::new(&raw[..]);
+        let response = parse_response(&mut reader).unwrap();
+        assert_eq!(response.status, 201);
+        assert_eq!(response.body, b"charged");
+        assert_eq!(
+            response
+                .headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("x-test"))
+                .map(|(_, v)| v.as_str()),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn parse_response_reads_body_to_eof_without_content_length() {
+        let raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nstreamed-body";
+        let mut reader = Cursor::new(&raw[..]);
+        let response = parse_response(&mut reader).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"streamed-body");
+    }
+
+    #[test]
+    fn write_response_then_parse_response_round_trips() {
+        let response = Response {
+            status: 200,
+            headers: vec![("X-A".into(), "b".into())],
+            body: b"hi".to_vec(),
+        };
+        let mut buf = Vec::new();
+        write_response(&mut buf, &response).unwrap();
+
+        let mut reader = Cursor::new(buf);
+        let parsed = parse_response(&mut reader).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body, b"hi");
     }
 }
