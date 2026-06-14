@@ -13,4 +13,5 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gateway;
 pub mod http;
