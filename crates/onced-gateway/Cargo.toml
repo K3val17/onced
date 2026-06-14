@@ -1,0 +1,9 @@
+[package]
+name = "onced-gateway"
+version = "0.0.0"
+description = "Onced HTTP gateway: a drop-in reverse proxy giving any endpoint exactly-once effect plus abuse defense."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onced-core = { path = "../onced-core" }

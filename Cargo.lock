@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "onced-core"
 version = "0.0.0"
+
+[[package]]
+name = "onced-gateway"
+version = "0.0.0"
+dependencies = [
+ "onced-core",
+]

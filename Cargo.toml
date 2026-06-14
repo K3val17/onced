@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/onced-core"]
+members = ["crates/onced-core", "crates/onced-gateway"]
 
 [workspace.package]
 edition = "2021"
