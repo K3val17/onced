@@ -1,0 +1,9 @@
+[package]
+name = "onced-sim"
+version = "0.0.0"
+description = "Deterministic simulation testing for the Onced engine: randomized fault injection (crashes, clock jumps, lease takeovers) with replayable seeds."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onced-core = { path = "../onced-core" }

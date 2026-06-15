@@ -12,3 +12,10 @@ version = "0.0.0"
 dependencies = [
  "onced-core",
 ]
+
+[[package]]
+name = "onced-sim"
+version = "0.0.0"
+dependencies = [
+ "onced-core",
+]
