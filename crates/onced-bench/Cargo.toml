@@ -1,0 +1,13 @@
+[package]
+name = "onced-bench"
+version = "0.0.0"
+description = "Zero-dependency throughput benchmarks for the Onced engine (in-memory and durable WAL paths)."
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+onced-core = { path = "../onced-core" }
+
+[[bin]]
+name = "onced-bench"
+path = "src/main.rs"
