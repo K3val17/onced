@@ -14,9 +14,9 @@ function you are changing and its callers — not whole modules. Laws live in
 
 | Concern | Crate / module | Key symbols |
 |---|---|---|
-| Idempotency state machine | `onced-core/src/engine.rs` | `Engine`, `begin`, `complete`, `Begin`, `RunToken`, `CompleteError` |
-| Storage trait + in-memory | `onced-core/src/store.rs` | `Store`, `MemoryStore`, `flush` |
-| Crash-safe durability | `onced-core/src/wal.rs` | `WalStore`, `open`, `open_buffered`, `encode_record`, `decode_record` |
+| Idempotency state machine | `onced-core/src/engine.rs` | `Engine`, `begin`, `complete`, `with_ttl`, `prune_expired`, `Begin`, `RunToken` |
+| Storage trait + in-memory | `onced-core/src/store.rs` | `Store`, `MemoryStore`, `flush`, `compact` |
+| Crash-safe durability + compaction | `onced-core/src/wal.rs` | `WalStore`, `open`, `open_buffered`, `compact`, `encode_record` |
 | Abuse / rate limiting | `onced-core/src/abuse.rs` | `SlidingWindowLimiter`, `RuleSet`, `Verdict`, `Action` |
 | Frequency / distinct counts | `onced-core/src/{sketch,hll}.rs` | `CountMinSketch`, `HyperLogLog` |
 | HTTP wire format | `onced-gateway/src/http.rs` | `parse_request`, `write_response`, `Request`, `Response` |

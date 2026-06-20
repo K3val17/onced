@@ -94,6 +94,23 @@ impl<S: Store> Engine<S> {
         self.store.flush();
     }
 
+    /// Reclaim space: drop every completed key whose TTL has elapsed at `now_ms`,
+    /// and compact the underlying store so the freed records' storage is actually
+    /// returned (for the WAL, a crash-safe log rewrite). In-progress keys are
+    /// always retained — a live lease must survive. Run this periodically (e.g.
+    /// once a minute), not on the request path.
+    pub fn prune_expired(&mut self, now_ms: u64) {
+        let ttl_ms = self.ttl_ms;
+        self.store.compact(&mut |_key, state| match state {
+            // A completed key is kept only while still within its TTL.
+            KeyState::Completed {
+                completed_at_ms, ..
+            } => now_ms < completed_at_ms.saturating_add(ttl_ms),
+            // A live (or recoverable) lease is always kept.
+            KeyState::InProgress { .. } => true,
+        });
+    }
+
     fn mint_fence(&mut self) -> Fence {
         let fence = Fence(self.next_fence);
         self.next_fence += 1;

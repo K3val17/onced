@@ -25,7 +25,7 @@ use std::time::Duration;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Milliseconds since the Unix epoch — the real clock injected into the engine.
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as u64)

@@ -35,6 +35,10 @@ this themselves, slowly and per-language. Onced does it once, correctly, and fas
   committed result (fencing tokens, after Kleppmann).
 - **Mismatch safety** — the same key carrying a *different* request is rejected, never
   served a stale replay.
+- **Bounded growth** — a completed key's cached outcome lives for a TTL (24h by default,
+  like Stripe), after which the key is recycled; a background sweep physically reclaims
+  expired records and compacts the write-ahead log (a Bitcask-style merge), so the
+  keyspace and the log do not grow without bound.
 
 ## How it works
 

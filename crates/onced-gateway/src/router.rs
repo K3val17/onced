@@ -91,6 +91,15 @@ impl<S: Store, U: Upstream> Router<S, U> {
         }
     }
 
+    /// Reclaim expired keys and compact every shard's store. Call periodically
+    /// from a background thread (e.g. once a minute), never on the request path.
+    pub fn prune_expired(&self, now_ms: u64) {
+        for shard in &self.shards {
+            let mut shard = shard.lock().unwrap_or_else(|p| p.into_inner());
+            shard.prune_expired(now_ms);
+        }
+    }
+
     /// Aggregate every shard's counters (plus the router's own `denied`) into one
     /// snapshot for `/metrics`.
     fn aggregate_metrics(&self) -> Metrics {

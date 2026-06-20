@@ -33,6 +33,15 @@ pub trait Store {
     /// `fsync` that commits a whole batch. A caller that needs durability must
     /// call this before acknowledging the operation.
     fn flush(&mut self) {}
+
+    /// Drop every entry for which `keep` returns false, and reclaim any space
+    /// their superseded records held. For an append-only log this is compaction
+    /// (a Bitcask-style merge): the live entries are rewritten to a fresh log and
+    /// the old, bloated one is replaced atomically. Default: retain nothing-aware
+    /// no-op for stores without reclaimable storage that also need no eviction.
+    fn compact(&mut self, keep: &mut dyn FnMut(&IdempotencyKey, &KeyState) -> bool) {
+        let _ = keep;
+    }
 }
 
 /// An in-memory [`Store`] for tests and development.
@@ -55,5 +64,9 @@ impl Store for MemoryStore {
 
     fn put(&mut self, key: IdempotencyKey, state: KeyState) {
         self.keys.insert(key, state);
+    }
+
+    fn compact(&mut self, keep: &mut dyn FnMut(&IdempotencyKey, &KeyState) -> bool) {
+        self.keys.retain(|key, state| keep(key, state));
     }
 }

@@ -204,6 +204,8 @@ pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeySta
 pub struct WalStore {
     index: HashMap<IdempotencyKey, KeyState>,
     file: std::fs::File,
+    /// The log's path, kept so compaction can rewrite it atomically.
+    path: std::path::PathBuf,
     /// Records appended since the last durable `flush`, not yet on the fd.
     pending: Vec<u8>,
     /// Strict mode: `fsync` inside every `put`. Group-commit mode: defer to
@@ -250,6 +252,7 @@ impl WalStore {
         Ok(Self {
             index,
             file,
+            path: path.to_path_buf(),
             pending: Vec::new(),
             sync_each,
         })
@@ -301,6 +304,58 @@ impl Store for WalStore {
 
     fn flush(&mut self) {
         self.flush_pending();
+    }
+
+    fn compact(&mut self, keep: &mut dyn FnMut(&IdempotencyKey, &KeyState) -> bool) {
+        // 1. Filter the live index. Every append since the last compaction that
+        //    overwrote a key, plus every entry `keep` now rejects (e.g. expired),
+        //    is dropped here.
+        self.index.retain(|key, state| keep(key, state));
+
+        // 2. Rewrite the log with exactly one record per surviving entry. This
+        //    collapses all the dead, superseded records the append-only log
+        //    accumulated (a Bitcask-style merge).
+        let mut compacted = Vec::new();
+        for (key, state) in &self.index {
+            compacted.extend_from_slice(&encode_record(key, state));
+        }
+
+        // 3. Commit it crash-safely: write the new log to a temp file, fsync it,
+        //    then atomically rename it over the live path. A crash before the
+        //    rename leaves the old log intact; after it, the new one — never a
+        //    half-written log. (fsync of the directory entry is a further
+        //    hardening; rename atomicity already protects the data.)
+        let tmp = self.path.with_extension("wal-compact");
+        {
+            let mut tmp_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .expect("onced WAL: open compaction temp failed; refusing to continue");
+            tmp_file
+                .write_all(&compacted)
+                .expect("onced WAL: write compaction temp failed; refusing to continue");
+            tmp_file
+                .sync_all()
+                .expect("onced WAL: fsync compaction temp failed; refusing to continue");
+        }
+        std::fs::rename(&tmp, &self.path)
+            .expect("onced WAL: atomic rename of compacted log failed; refusing to continue");
+
+        // 4. Reopen the live file at the end of the freshly written data. The
+        //    pending buffer's records are already reflected in the index (and so
+        //    in the compacted log we just fsync'd), so drop it — compaction is
+        //    itself a durability point.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .expect("onced WAL: reopen after compaction failed; refusing to continue");
+        file.seek(SeekFrom::End(0))
+            .expect("onced WAL: seek after compaction failed; refusing to continue");
+        self.file = file;
+        self.pending.clear();
     }
 }
 
@@ -547,6 +602,93 @@ mod tests {
                 1_000 + lease_ms + 1,
             )
             .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Compaction collapses the dead, superseded records an append-only log
+    /// accumulates: hammering one key 200 times then compacting must shrink the
+    /// file, and the live value must survive a reopen.
+    #[test]
+    fn compaction_collapses_superseded_records() {
+        let path = temp_wal_path("compact");
+        let key = IdempotencyKey("hot".into());
+
+        let mut store = WalStore::open(&path).unwrap();
+        for i in 0..200 {
+            store.put(key.clone(), completed(200, format!("v{i}").as_bytes()));
+        }
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        store.compact(&mut |_, _| true); // keep everything; just collapse history
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < before,
+            "compaction should shrink the log: {after} !< {before}"
+        );
+
+        let reopened = WalStore::open(&path).unwrap();
+        assert_eq!(reopened.get(&key), Some(&completed(200, b"v199")));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Compaction drops entries the `keep` predicate rejects, and the rest
+    /// survive a reopen.
+    #[test]
+    fn compaction_drops_rejected_entries() {
+        let path = temp_wal_path("compact-drop");
+        let mut store = WalStore::open(&path).unwrap();
+        for i in 0..10u32 {
+            store.put(IdempotencyKey(format!("k{i}")), completed(200, b"x"));
+        }
+
+        // Keep only odd-numbered keys.
+        store.compact(&mut |k, _| k.0.trim_start_matches('k').parse::<u32>().unwrap() % 2 == 1);
+
+        let reopened = WalStore::open(&path).unwrap();
+        for i in 0..10u32 {
+            let present = reopened.get(&IdempotencyKey(format!("k{i}"))).is_some();
+            assert_eq!(present, i % 2 == 1, "wrong retention for key k{i}");
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `Engine::prune_expired` physically removes an expired completed key from
+    /// the durable log, not just logically: after a prune, a reopened store does
+    /// not contain it.
+    #[test]
+    fn prune_expired_physically_removes_expired_keys() {
+        use crate::engine::{Begin, Engine};
+
+        let path = temp_wal_path("prune");
+        const TTL: u64 = 10_000;
+        let key = IdempotencyKey("old".into());
+
+        {
+            let mut engine = Engine::with_ttl(WalStore::open(&path).unwrap(), 30_000, TTL);
+            let token = match engine.begin(key.clone(), RequestFingerprint([1u8; 32]), 1_000) {
+                Begin::Run(token) => token,
+                other => panic!("expected Run, got {other:?}"),
+            };
+            engine
+                .complete(
+                    token,
+                    CachedOutcome {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: b"x".to_vec(),
+                    },
+                    1_000,
+                )
+                .unwrap();
+            // Now past the key's TTL: prune should physically drop it.
+            engine.prune_expired(1_000 + TTL + 1);
+        }
+
+        let store = WalStore::open(&path).unwrap();
+        assert_eq!(store.get(&key), None, "expired key must be gone from disk");
 
         let _ = std::fs::remove_file(&path);
     }

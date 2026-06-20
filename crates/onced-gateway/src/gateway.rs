@@ -118,6 +118,12 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
         &self.metrics
     }
 
+    /// Reclaim expired keys and compact the store. Run off the request path (a
+    /// background sweep), not per request.
+    pub fn prune_expired(&mut self, now_ms: u64) {
+        self.engine.prune_expired(now_ms);
+    }
+
     /// Handle one request end to end (operational endpoints, abuse, then
     /// idempotency) and produce the response to send back to the client. This is
     /// the single-shard entry point; the sharded [`Router`](crate::router::Router)

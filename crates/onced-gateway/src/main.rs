@@ -19,13 +19,16 @@ use onced_core::engine::Engine;
 use onced_core::wal::WalStore;
 use onced_gateway::gateway::Gateway;
 use onced_gateway::router::Router;
-use onced_gateway::server::{serve, HttpUpstream};
+use onced_gateway::server::{now_ms, serve, HttpUpstream};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::available_parallelism;
+use std::time::Duration;
 
 const LEASE_MS: u64 = 30_000;
+/// How often the background sweep reclaims expired keys and compacts the WAL.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(60);
 
 fn main() -> std::io::Result<()> {
     let listen = env_or("ONCED_LISTEN", "127.0.0.1:8080");
@@ -58,6 +61,14 @@ fn main() -> std::io::Result<()> {
     // held. HttpUpstream opens a fresh connection per request, so sharing is safe.
     let upstream = HttpUpstream::new(backend.clone());
     let router = Arc::new(Router::new(shards, abuse, upstream));
+
+    // Background sweep: reclaim expired keys and compact each shard's WAL off the
+    // request path. Cheap and infrequent; a fixed cadence is plenty.
+    let pruner = Arc::clone(&router);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(PRUNE_INTERVAL);
+        pruner.prune_expired(now_ms());
+    });
 
     let listener = TcpListener::bind(&listen)?;
     eprintln!(
