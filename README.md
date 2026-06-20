@@ -62,11 +62,18 @@ client ──Idempotency-Key──▶ onced-gateway ──(once)──▶ your b
 ```sh
 # 1. point Onced at your backend and run it
 ONCED_BACKEND=127.0.0.1:9000 cargo run --release -p onced-gateway
-# listens on 127.0.0.1:8080 by default (ONCED_LISTEN, ONCED_WAL to override)
+# listens on 127.0.0.1:8080 by default (ONCED_LISTEN, ONCED_WAL, ONCED_SHARDS to override)
 
 # 2. send the same request twice with one key — backend is hit once
 curl -X POST localhost:8080/charge -H 'Idempotency-Key: abc-123' -d 'amount=500'
 curl -X POST localhost:8080/charge -H 'Idempotency-Key: abc-123' -d 'amount=500'  # replayed
+```
+
+Or run the whole thing end to end (spins up a backend, sends duplicates, shows the
+backend is charged once, then prints metrics):
+
+```sh
+./examples/demo.sh      # requires python3 + curl
 ```
 
 ## Observability

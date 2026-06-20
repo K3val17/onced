@@ -13,8 +13,8 @@
 //!
 //! See `docs/superpowers/specs/2026-06-13-onced-design.md` for the full design.
 //!
-//! Status: **Phase 0** — this file establishes the shared vocabulary only.
-//! Behaviour (the state-machine transitions) arrives in Phase 1 under TDD.
+//! This file establishes the shared vocabulary (the persisted key states); the
+//! behaviour that operates on it lives in [`engine`], [`store`], and [`wal`].
 
 #![forbid(unsafe_code)]
 
@@ -66,8 +66,9 @@ pub struct CachedOutcome {
 ///
 /// The states form a **one-directional DAG** (Stripe / brandur): an `InProgress`
 /// key may only advance to `Completed`, and a `Completed` outcome is never
-/// overwritten. That monotonicity is the invariant the simulation tests will
-/// assert against in later phases.
+/// overwritten — until it expires past its TTL and the key is recycled. That
+/// monotonicity is the invariant the deterministic simulation asserts after
+/// every operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyState {
     /// A fenced worker currently holds the lock and is executing the side effect.

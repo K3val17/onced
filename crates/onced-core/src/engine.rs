@@ -1,9 +1,9 @@
 //! The idempotency engine: the one-directional state machine that turns a
 //! stream of possibly-duplicated requests into an **exactly-once effect**.
 //!
-//! Production code is written test-first (TDD). The tests below are the full
-//! behavioural specification for Phase 1; they are written and watched failing
-//! before the engine that satisfies them exists.
+//! Written test-first: the tests below are the behavioural specification, and
+//! the deterministic simulation in `onced-sim` exercises the same state machine
+//! through millions of fault-injected schedules.
 
 use crate::store::Store;
 use crate::{CachedOutcome, Fence, IdempotencyKey, KeyState, RequestFingerprint};
