@@ -86,6 +86,11 @@ pub enum KeyState {
         fingerprint: RequestFingerprint,
         /// The response to replay for every future request bearing this key.
         outcome: CachedOutcome,
+        /// Injected wall-clock millis at which the key completed. After
+        /// `completed_at_ms + ttl` the key is expired and may be recycled by a
+        /// brand-new request — the 24h key-recycling Stripe applies so the keyspace
+        /// does not grow without bound.
+        completed_at_ms: u64,
     },
 }
 
@@ -111,6 +116,7 @@ mod tests {
                 headers: BTreeMap::new(),
                 body: b"ok".to_vec(),
             },
+            completed_at_ms: 12_000,
         };
 
         // An in-progress key is distinct from a completed one.

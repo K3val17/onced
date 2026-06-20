@@ -16,9 +16,17 @@ pub struct Engine<S: Store> {
     /// How long a worker may hold a key before its lease is presumed dead and a
     /// retry is allowed to take over.
     lease_ms: u64,
+    /// How long a completed key's cached outcome is honoured. After this, the key
+    /// is expired and a fresh request may recycle it — the bounded-keyspace
+    /// discipline Stripe applies (24h key recycling).
+    ttl_ms: u64,
     /// Next fence to mint. Monotonic; never reused within a shard's lifetime.
     next_fence: u64,
 }
+
+/// Default time-to-live for a completed key's cached outcome: 24 hours, matching
+/// Stripe's idempotency-key recycling window.
+pub const DEFAULT_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 
 /// The decision [`Engine::begin`] returns for an incoming request.
 #[derive(Debug)]
@@ -57,8 +65,16 @@ pub enum CompleteError {
 }
 
 impl<S: Store> Engine<S> {
-    /// Create an engine over `store`, with a per-key lease of `lease_ms`.
+    /// Create an engine over `store`, with a per-key lease of `lease_ms` and the
+    /// [`DEFAULT_TTL_MS`] completed-key time-to-live.
     pub fn new(store: S, lease_ms: u64) -> Self {
+        Self::with_ttl(store, lease_ms, DEFAULT_TTL_MS)
+    }
+
+    /// Create an engine with an explicit completed-key time-to-live. After
+    /// `ttl_ms` past completion, a key is expired and a brand-new request may
+    /// recycle it.
+    pub fn with_ttl(store: S, lease_ms: u64, ttl_ms: u64) -> Self {
         // Seed the fence counter above anything recovered from a durable store,
         // so a freshly minted fence never collides with a fence a live worker
         // might still hold after a crash. A fresh/empty store yields 1.
@@ -66,6 +82,7 @@ impl<S: Store> Engine<S> {
         Self {
             store,
             lease_ms,
+            ttl_ms,
             next_fence,
         }
     }
@@ -123,8 +140,13 @@ impl<S: Store> Engine<S> {
             Some(KeyState::Completed {
                 fingerprint: stored,
                 outcome,
+                completed_at_ms,
             }) => {
-                if *stored == fingerprint {
+                if now_ms >= completed_at_ms.saturating_add(self.ttl_ms) {
+                    // The key's outcome has outlived its TTL: recycle it as if it
+                    // were a brand-new key, whatever request now bears it.
+                    Action::Start
+                } else if *stored == fingerprint {
                     Action::Replay(outcome.clone())
                 } else {
                     Action::Mismatch
@@ -153,12 +175,14 @@ impl<S: Store> Engine<S> {
         }
     }
 
-    /// Commit the outcome of a side effect. Only the current fence holder may
-    /// complete, and once completed the result is immutable.
+    /// Commit the outcome of a side effect, completing at `now_ms` (which starts
+    /// the key's TTL clock). Only the current fence holder may complete, and once
+    /// completed the result is immutable until it expires.
     pub fn complete(
         &mut self,
         token: RunToken,
         outcome: CachedOutcome,
+        now_ms: u64,
     ) -> Result<(), CompleteError> {
         let fingerprint = match self.store.get(&token.key) {
             Some(KeyState::InProgress {
@@ -178,6 +202,7 @@ impl<S: Store> Engine<S> {
             KeyState::Completed {
                 fingerprint,
                 outcome,
+                completed_at_ms: now_ms,
             },
         );
         Ok(())
@@ -232,7 +257,7 @@ mod tests {
         let token = run_token(&mut engine, &k, f, 1_000);
         let result = outcome(201, b"charged");
         engine
-            .complete(token, result.clone())
+            .complete(token, result.clone(), 1_000)
             .expect("the only in-flight attempt should complete");
 
         match engine.begin(k, f, 1_005) {
@@ -268,7 +293,7 @@ mod tests {
             Begin::Mismatch
         ));
 
-        engine.complete(token, outcome(200, b"ok")).unwrap();
+        engine.complete(token, outcome(200, b"ok"), 1_001).unwrap();
         assert!(matches!(engine.begin(k, imposter, 1_002), Begin::Mismatch));
     }
 
@@ -286,12 +311,14 @@ mod tests {
         let fresh = run_token(&mut engine, &k, f, 1_000 + LEASE_MS);
 
         assert_eq!(
-            engine.complete(stalled, outcome(500, b"stale")),
+            engine.complete(stalled, outcome(500, b"stale"), 1_000 + LEASE_MS),
             Err(CompleteError::StaleFence),
         );
 
         let good = outcome(201, b"fresh");
-        engine.complete(fresh, good.clone()).unwrap();
+        engine
+            .complete(fresh, good.clone(), 1_000 + LEASE_MS)
+            .unwrap();
 
         assert!(matches!(engine.begin(k, f, 1_000 + LEASE_MS + 1), Begin::Replay(o) if o == good));
     }
@@ -306,12 +333,45 @@ mod tests {
 
         let token = run_token(&mut engine, &k, f, 1_000);
         let first = outcome(201, b"first");
-        engine.complete(token.clone(), first.clone()).unwrap();
+        engine
+            .complete(token.clone(), first.clone(), 1_000)
+            .unwrap();
 
         assert_eq!(
-            engine.complete(token, outcome(200, b"second")),
+            engine.complete(token, outcome(200, b"second"), 1_001),
             Err(CompleteError::AlreadyCompleted),
         );
         assert!(matches!(engine.begin(k, f, 1_001), Begin::Replay(o) if o == first));
+    }
+
+    /// Within its TTL a completed key still replays; once the TTL elapses the key
+    /// is recycled, so a brand-new request — even a *different* one reusing the
+    /// same key string — gets to Run rather than replaying a stale outcome. This
+    /// is Stripe's bounded-keyspace key recycling.
+    #[test]
+    fn a_completed_key_is_recycled_after_its_ttl() {
+        const TTL: u64 = 10_000;
+        let mut engine = Engine::with_ttl(MemoryStore::new(), LEASE_MS, TTL);
+        let k = key("charge-ttl");
+        let f = fp(1);
+
+        let token = run_token(&mut engine, &k, f, 1_000);
+        engine
+            .complete(token, outcome(201, b"first"), 1_000)
+            .unwrap();
+
+        // Just before expiry: still replays the cached outcome.
+        assert!(matches!(
+            engine.begin(k.clone(), f, 1_000 + TTL - 1),
+            Begin::Replay(o) if o == outcome(201, b"first")
+        ));
+
+        // At/after expiry: recycled. A different request reusing the key now Runs
+        // (rather than being rejected as a mismatch against the expired outcome).
+        let different = fp(9);
+        assert!(matches!(
+            engine.begin(k, different, 1_000 + TTL),
+            Begin::Run(_)
+        ));
     }
 }

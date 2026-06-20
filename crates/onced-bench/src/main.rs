@@ -62,7 +62,7 @@ fn main() {
         let mut engine = Engine::new(MemoryStore::new(), LEASE_MS);
         throughput("memory: begin + complete (unique key)", n, |i| {
             if let Begin::Run(token) = engine.begin(key(i), fingerprint(i), 1) {
-                let _ = engine.complete(token, outcome());
+                let _ = engine.complete(token, outcome(), 1);
             }
         });
     }
@@ -71,7 +71,7 @@ fn main() {
     {
         let mut engine = Engine::new(MemoryStore::new(), LEASE_MS);
         if let Begin::Run(token) = engine.begin(key(0), fingerprint(0), 1) {
-            engine.complete(token, outcome()).unwrap();
+            engine.complete(token, outcome(), 1).unwrap();
         }
         throughput("memory: replay (completed key)", n, |_| {
             match engine.begin(key(0), fingerprint(0), 2) {
@@ -93,7 +93,7 @@ fn main() {
         let wal_n = (n / 100).max(1_000);
         throughput("wal (durable, fsync): begin + complete", wal_n, |i| {
             if let Begin::Run(token) = engine.begin(key(i), fingerprint(i), 1) {
-                let _ = engine.complete(token, outcome());
+                let _ = engine.complete(token, outcome(), 1);
             }
         });
         let _ = std::fs::remove_file(&path);
@@ -111,7 +111,7 @@ fn main() {
         let gc_n = (n / 10).max(10_000);
         throughput("wal group-commit (1 fsync / 256 commits)", gc_n, |i| {
             if let Begin::Run(token) = engine.begin(key(i), fingerprint(i), 1) {
-                let _ = engine.complete(token, outcome());
+                let _ = engine.complete(token, outcome(), 1);
             }
             if i % batch == batch - 1 {
                 engine.flush();

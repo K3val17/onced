@@ -170,7 +170,7 @@ where
         let mut shard = self.shards[shard_idx]
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        shard.complete_phase(ticket, forwarded)
+        shard.complete_phase(ticket, forwarded, now_ms)
     }
 }
 

@@ -116,9 +116,11 @@ pub(crate) fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
         KeyState::Completed {
             fingerprint,
             outcome,
+            completed_at_ms,
         } => {
             payload.push(TAG_COMPLETED);
             payload.extend_from_slice(&fingerprint.0);
+            put_u64(&mut payload, *completed_at_ms);
             put_u16(&mut payload, outcome.status);
             put_u32(&mut payload, outcome.headers.len() as u32);
             for (name, value) in &outcome.headers {
@@ -159,6 +161,7 @@ pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeySta
         },
         TAG_COMPLETED => {
             let fingerprint = RequestFingerprint(reader.arr32()?);
+            let completed_at_ms = reader.u64()?;
             let status = reader.u16()?;
             let header_count = reader.u32()? as usize;
             let mut headers = BTreeMap::new();
@@ -175,6 +178,7 @@ pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeySta
                     headers,
                     body,
                 },
+                completed_at_ms,
             }
         }
         _ => return None,
@@ -331,6 +335,7 @@ mod tests {
                 headers,
                 body: body.to_vec(),
             },
+            completed_at_ms: 50_000,
         }
     }
 
@@ -526,6 +531,7 @@ mod tests {
                     headers: BTreeMap::new(),
                     body: b"stale".to_vec(),
                 },
+                1_000 + lease_ms + 1,
             ),
             Err(CompleteError::StaleFence),
         );
@@ -538,6 +544,7 @@ mod tests {
                     headers: BTreeMap::new(),
                     body: b"fresh".to_vec(),
                 },
+                1_000 + lease_ms + 1,
             )
             .unwrap();
 
@@ -597,6 +604,7 @@ mod tests {
                         headers,
                         body,
                     },
+                    completed_at_ms: rng.next_u64(),
                 }
             }
         }

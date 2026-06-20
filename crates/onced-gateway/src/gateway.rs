@@ -160,7 +160,7 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
             BeginPhase::Done(response) => response,
             BeginPhase::Forward(ticket) => {
                 let forwarded = self.upstream.forward(request);
-                self.complete_phase(ticket, forwarded)
+                self.complete_phase(ticket, forwarded, now_ms)
             }
         }
     }
@@ -212,6 +212,7 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
         &mut self,
         ticket: ForwardTicket,
         forwarded: std::io::Result<Response>,
+        now_ms: u64,
     ) -> Response {
         match (ticket.token, forwarded) {
             // Idempotent request, backend answered: cache and serve once.
@@ -220,7 +221,7 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
                 // the lease. If it overran and a retry took over, complete()
                 // returns an error and the takeover's result is the one served;
                 // pick a lease comfortably above backend latency.
-                let _ = self.engine.complete(token, to_outcome(&response));
+                let _ = self.engine.complete(token, to_outcome(&response), now_ms);
                 self.metrics.created += 1;
                 tag(response, "created")
             }
@@ -571,7 +572,7 @@ mod tests {
             headers: Vec::new(),
             body: b"charged".to_vec(),
         };
-        let resp = gw.complete_phase(ticket, Ok(backend));
+        let resp = gw.complete_phase(ticket, Ok(backend), 1_002);
         assert_eq!(header(&resp, "Onced-Status"), Some("created"));
 
         // A later retry now replays the committed outcome.

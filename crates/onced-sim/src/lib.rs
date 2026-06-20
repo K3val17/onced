@@ -315,7 +315,10 @@ impl Simulation {
         let worker = self.inflight.remove(which);
         let index = worker.index;
 
-        match self.engine.complete(worker.token, worker.outcome.clone()) {
+        match self
+            .engine
+            .complete(worker.token, worker.outcome.clone(), self.now_ms)
+        {
             Ok(()) => {
                 self.stats.completes_ok += 1;
                 self.committed.insert(index, worker.outcome.clone());
