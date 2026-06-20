@@ -74,6 +74,11 @@ pub struct Stats {
     pub already_completed: u64,
     pub crashes: u64,
     pub takeovers: u64,
+    /// Group-commit flushes (buffered mode only).
+    pub flushes: u64,
+    /// Completions of an orphaned token whose begin was lost on a pre-flush
+    /// crash (buffered mode only) — refused with `Unknown`, never a double effect.
+    pub unknown_completes: u64,
 }
 
 impl Stats {
@@ -88,7 +93,20 @@ impl Stats {
         self.already_completed += other.already_completed;
         self.crashes += other.crashes;
         self.takeovers += other.takeovers;
+        self.flushes += other.flushes;
+        self.unknown_completes += other.unknown_completes;
     }
+}
+
+/// Which write-ahead-log durability discipline a simulation drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Durability {
+    /// One `fsync` per write: a completed key is durable the instant it commits.
+    Strict,
+    /// Group commit: writes are durable only after an explicit flush. A crash
+    /// before flush loses un-flushed writes — which the engine must tolerate
+    /// without ever exposing two different durable outcomes for one key.
+    GroupCommit,
 }
 
 /// A worker that holds a run token for a key, plus the outcome it intends to
@@ -102,14 +120,23 @@ struct Inflight {
 /// One simulation run, seeded and self-contained (its own WAL file).
 pub struct Simulation {
     seed: u64,
+    mode: Durability,
     rng: Rng,
     wal_path: PathBuf,
     engine: Engine<WalStore>,
     now_ms: u64,
     inflight: Vec<Inflight>,
-    /// Oracle: the committed outcome per key index (what replays must return).
+    /// Oracle: the in-memory committed outcome per key (what a replay must return
+    /// *now*). In group-commit mode this is reset to `durable` after a crash,
+    /// since un-flushed completions are lost.
     committed: HashMap<u64, CachedOutcome>,
-    /// Oracle: count of successful completions per key index (must stay <= 1).
+    /// Oracle: the *durable* outcome per key — set once it has been flushed, and
+    /// asserted never to change (the durable exactly-once invariant). In strict
+    /// mode a completion is durable immediately, so this mirrors `committed`.
+    durable: HashMap<u64, CachedOutcome>,
+    /// Oracle: count of successful completions per key index. In strict mode this
+    /// must stay <= 1; in group-commit mode a lost completion may be retried, so
+    /// it is not asserted on.
     successful_completes: HashMap<u64, u64>,
     /// Monotonic source of distinct outcome bodies.
     next_body: u64,
@@ -129,8 +156,14 @@ fn fingerprint_of(index: u64) -> RequestFingerprint {
 }
 
 impl Simulation {
-    /// Create a fresh simulation for `seed`, backed by a unique temp WAL file.
+    /// Create a fresh **strict-durability** simulation for `seed`.
     pub fn new(seed: u64) -> Self {
+        Self::with_mode(seed, Durability::Strict)
+    }
+
+    /// Create a fresh simulation for `seed` under durability `mode`, backed by a
+    /// unique temp WAL file.
+    pub fn with_mode(seed: u64, mode: Durability) -> Self {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let wal_path = std::env::temp_dir().join(format!(
@@ -139,15 +172,17 @@ impl Simulation {
         ));
         let _ = std::fs::remove_file(&wal_path);
 
-        let store = WalStore::open(&wal_path).expect("open sim wal");
+        let store = open_store(&wal_path, mode);
         Simulation {
             seed,
+            mode,
             rng: Rng::new(seed),
             wal_path,
             engine: Engine::new(store, LEASE_MS),
             now_ms: 1,
             inflight: Vec::new(),
             committed: HashMap::new(),
+            durable: HashMap::new(),
             successful_completes: HashMap::new(),
             next_body: 0,
             stats: Stats::default(),
@@ -168,13 +203,59 @@ impl Simulation {
     }
 
     fn step(&mut self) {
-        match self.rng.below(100) {
-            0..=39 => self.do_begin(),
-            40..=69 => self.do_complete(),
-            70..=84 => self.do_advance_clock(),
-            _ => self.do_crash(),
+        let roll = self.rng.below(100);
+        match self.mode {
+            // Strict mode keeps the original distribution exactly (no flush step:
+            // every write is durable the instant it commits).
+            Durability::Strict => match roll {
+                0..=39 => self.do_begin(),
+                40..=69 => self.do_complete(),
+                70..=84 => self.do_advance_clock(),
+                _ => self.do_crash(),
+            },
+            // Group-commit mode interleaves explicit flushes; crashes between
+            // flushes are where un-flushed writes are lost.
+            Durability::GroupCommit => match roll {
+                0..=34 => self.do_begin(),
+                35..=59 => self.do_complete(),
+                60..=74 => self.do_flush(),
+                75..=84 => self.do_advance_clock(),
+                _ => self.do_crash(),
+            },
         }
         self.stats.steps += 1;
+    }
+
+    /// Group commit: flush the WAL, making every preceding write durable. Every
+    /// key currently committed in memory is now on disk, so it becomes durable —
+    /// and its durable outcome must never change (asserted in `mark_durable`).
+    fn do_flush(&mut self) {
+        self.stats.flushes += 1;
+        self.engine.flush();
+        let now_durable: Vec<(u64, CachedOutcome)> = self
+            .committed
+            .iter()
+            .map(|(index, outcome)| (*index, outcome.clone()))
+            .collect();
+        for (index, outcome) in now_durable {
+            self.mark_durable(index, outcome);
+        }
+    }
+
+    /// Record `outcome` as the durable outcome for `index`, asserting the durable
+    /// exactly-once invariant: once a key is durable, its outcome never changes.
+    fn mark_durable(&mut self, index: u64, outcome: CachedOutcome) {
+        match self.durable.get(&index) {
+            Some(existing) => assert_eq!(
+                *existing, outcome,
+                "seed {}: durable outcome for key {index} changed \
+                 -- durable exactly-once is violated",
+                self.seed
+            ),
+            None => {
+                self.durable.insert(index, outcome);
+            }
+        }
     }
 
     fn make_outcome(&mut self) -> CachedOutcome {
@@ -237,16 +318,26 @@ impl Simulation {
         match self.engine.complete(worker.token, worker.outcome.clone()) {
             Ok(()) => {
                 self.stats.completes_ok += 1;
-                let count = self.successful_completes.entry(index).or_insert(0);
-                *count += 1;
-                // INVARIANT 1: exactly-once effect.
-                assert_eq!(
-                    *count, 1,
-                    "seed {}: key {index} was successfully completed {count} times \
-                     -- exactly-once is violated",
-                    self.seed
-                );
-                self.committed.insert(index, worker.outcome);
+                self.committed.insert(index, worker.outcome.clone());
+                match self.mode {
+                    Durability::Strict => {
+                        // Durable immediately, so a key completes at most once.
+                        let count = self.successful_completes.entry(index).or_insert(0);
+                        *count += 1;
+                        // INVARIANT 1 (strict): exactly-once effect.
+                        assert_eq!(
+                            *count, 1,
+                            "seed {}: key {index} was successfully completed {count} times \
+                             -- strict exactly-once is violated",
+                            self.seed
+                        );
+                        self.mark_durable(index, worker.outcome);
+                    }
+                    // In group-commit mode the completion is only in memory until
+                    // the next flush; a pre-flush crash may revert it and a retry
+                    // may complete again. Durability is asserted at flush time.
+                    Durability::GroupCommit => {}
+                }
             }
             Err(CompleteError::StaleFence) => {
                 // INVARIANT 4: a superseded worker is refused.
@@ -261,12 +352,17 @@ impl Simulation {
                     self.seed
                 );
             }
-            Err(CompleteError::Unknown) => {
-                panic!(
+            Err(CompleteError::Unknown) => match self.mode {
+                // Strict: a begin is durable before its token escapes, so the
+                // record always exists at completion time.
+                Durability::Strict => panic!(
                     "seed {}: unexpected Unknown completing key {index}",
                     self.seed
-                )
-            }
+                ),
+                // Group commit: the begin may have been lost on a pre-flush crash,
+                // orphaning this token. Refusal is correct — no double effect.
+                Durability::GroupCommit => self.stats.unknown_completes += 1,
+            },
         }
     }
 
@@ -285,11 +381,19 @@ impl Simulation {
         self.stats.crashes += 1;
 
         // Drop the engine (closing the WAL) and recover from disk. In-flight
-        // worker tokens deliberately survive.
-        let store = WalStore::open(&self.wal_path).expect("recover sim wal");
+        // worker tokens deliberately survive (a worker outlives a gateway crash).
+        let store = open_store(&self.wal_path, self.mode);
         self.engine = Engine::new(store, LEASE_MS);
 
-        // INVARIANT 2: every committed key replays its exact outcome post-crash.
+        // In group-commit mode a crash loses every un-flushed write, so the
+        // in-memory oracle must fall back to what was durable. (In strict mode
+        // `durable` already equals `committed`, so this is a no-op.)
+        if self.mode == Durability::GroupCommit {
+            self.committed = self.durable.clone();
+        }
+
+        // INVARIANT 2: every key the oracle believes is durable replays its exact
+        // outcome after the crash.
         let committed: Vec<(u64, CachedOutcome)> = self
             .committed
             .iter()
@@ -312,6 +416,14 @@ impl Simulation {
     }
 }
 
+/// Open the WAL store in the discipline this simulation drives.
+fn open_store(path: &std::path::Path, mode: Durability) -> WalStore {
+    match mode {
+        Durability::Strict => WalStore::open(path).expect("open strict sim wal"),
+        Durability::GroupCommit => WalStore::open_buffered(path).expect("open buffered sim wal"),
+    }
+}
+
 fn begin_name(begin: &Begin) -> &'static str {
     match begin {
         Begin::Run(_) => "Run",
@@ -323,7 +435,7 @@ fn begin_name(begin: &Begin) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Simulation, Stats};
+    use super::{Durability, Simulation, Stats};
 
     /// The campaign: many seeds, each a long fault-injected run. The real checks
     /// are the invariant assertions inside the simulation; reaching the end means
@@ -355,5 +467,43 @@ mod tests {
         );
 
         eprintln!("DST campaign held all invariants: {total:?}");
+    }
+
+    /// Group-commit campaign: the same fault injection, but writes are durable
+    /// only after a flush, and crashes between flushes lose un-flushed writes.
+    /// The load-bearing checks run inside the simulation; reaching the end means
+    /// none fired. They are: **durable exactly-once** — a key's durable outcome,
+    /// once flushed, never changes (`mark_durable`); **durability** — every
+    /// durable key replays its exact outcome after a crash that wiped the
+    /// un-flushed tail; and **no double effect** — an orphaned token (its begin
+    /// lost pre-flush) is refused with `Unknown`, never silently re-run. The
+    /// counter assertions prove the run actually exercised flushes, data-losing
+    /// crashes, and orphaned-token refusals, so a clean pass is not vacuous.
+    #[test]
+    fn group_commit_holds_durable_exactly_once_across_crashes() {
+        let mut total = Stats::default();
+        let mut durable_seen = false;
+        for seed in 0..16u64 {
+            let mut sim = Simulation::with_mode(seed, Durability::GroupCommit);
+            let stats = sim.run(600);
+            durable_seen |= !sim.durable.is_empty();
+            sim.cleanup();
+            total.accumulate(&stats);
+        }
+
+        assert!(total.flushes > 0, "campaign never flushed: {total:?}");
+        assert!(total.crashes > 0, "campaign injected no crashes: {total:?}");
+        assert!(
+            total.completes_ok > 0,
+            "campaign committed nothing: {total:?}"
+        );
+        assert!(durable_seen, "campaign never made a key durable: {total:?}");
+        assert!(
+            total.unknown_completes > 0,
+            "campaign never orphaned a token across a pre-flush crash \
+             (group-commit recovery path unexercised): {total:?}"
+        );
+
+        eprintln!("group-commit DST held durable exactly-once: {total:?}");
     }
 }
