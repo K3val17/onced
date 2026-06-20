@@ -54,7 +54,10 @@ fn main() -> std::io::Result<()> {
         .map(|_| RuleSet::new().rule("per-ip-per-second", 1_000, 50, Action::Throttle))
         .collect();
 
-    let router = Arc::new(Router::new(shards, abuse));
+    // The shared backend client the router forwards through with no shard lock
+    // held. HttpUpstream opens a fresh connection per request, so sharing is safe.
+    let upstream = HttpUpstream::new(backend.clone());
+    let router = Arc::new(Router::new(shards, abuse, upstream));
 
     let listener = TcpListener::bind(&listen)?;
     eprintln!(

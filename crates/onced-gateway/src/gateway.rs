@@ -17,7 +17,7 @@
 
 use crate::http::{Request, Response};
 use onced_core::abuse::{Action, RuleSet, Verdict};
-use onced_core::engine::{Begin, Engine};
+use onced_core::engine::{Begin, Engine, RunToken};
 use onced_core::store::Store;
 use onced_core::{CachedOutcome, IdempotencyKey, RequestFingerprint};
 use std::collections::hash_map::DefaultHasher;
@@ -145,69 +145,121 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
     }
 
     /// The idempotency + passthrough stage, run *after* the abuse check has
-    /// already passed.
+    /// already passed, holding the lock across the backend call.
     ///
-    /// The sharded [`Router`](crate::router::Router) calls this directly: it
-    /// runs its own shared, IP-sharded abuse stage before dispatch, so abuse
-    /// counters stay global even though idempotency state is sharded by key.
-    /// `requests_total` counts requests that reached this stage (i.e. were not
-    /// denied); denials are counted separately by whoever ran the abuse stage.
+    /// This is the single-shard convenience path: it composes [`begin_phase`],
+    /// the upstream forward, and [`complete_phase`] in one call. The sharded
+    /// [`Router`](crate::router::Router) instead drives those three steps itself
+    /// so it can **release the shard lock during the forward** — see those
+    /// methods.
+    ///
+    /// [`begin_phase`]: Gateway::begin_phase
+    /// [`complete_phase`]: Gateway::complete_phase
     pub fn handle_after_abuse(&mut self, request: &Request, now_ms: u64) -> Response {
+        match self.begin_phase(request, now_ms) {
+            BeginPhase::Done(response) => response,
+            BeginPhase::Forward(ticket) => {
+                let forwarded = self.upstream.forward(request);
+                self.complete_phase(ticket, forwarded)
+            }
+        }
+    }
+
+    /// Phase 1 of the request: decide, under the lock, what to do. Either the
+    /// answer is already known (a replay, a 409 in-progress, or a 422 mismatch —
+    /// returned as [`BeginPhase::Done`]) or the backend must be called
+    /// ([`BeginPhase::Forward`] carries a ticket to hand back to
+    /// [`complete_phase`]). `requests_total` is counted here.
+    ///
+    /// Splitting begin from complete lets a caller drop the shard lock during the
+    /// slow backend call: while one key is being forwarded, other keys on the
+    /// same shard make progress, and a concurrent retry of the *same* key sees
+    /// `InProgress` and is told to wait — so exactly-once still holds.
+    ///
+    /// [`complete_phase`]: Gateway::complete_phase
+    pub fn begin_phase(&mut self, request: &Request, now_ms: u64) -> BeginPhase {
         self.metrics.requests_total += 1;
 
         // Idempotency is opt-in via the Idempotency-Key header (like Stripe).
+        // A keyless request carries no state: forward it with no token.
         let Some(key) = request.header("idempotency-key") else {
-            return self.pass_through(request);
+            return BeginPhase::Forward(ForwardTicket { token: None });
         };
         let key = IdempotencyKey(key.to_string());
         let fingerprint = fingerprint_of(request);
 
         match self.engine.begin(key, fingerprint, now_ms) {
-            Begin::Run(token) => {
-                let response = match self.upstream.forward(request) {
-                    Ok(response) => response,
-                    // Leave the token in-progress: its lease lets a later retry
-                    // take over rather than wedging the key forever.
-                    Err(_) => {
-                        self.metrics.upstream_error += 1;
-                        return bad_gateway();
-                    }
-                };
-                // Exactly-once holds as long as the backend call finishes within
-                // the lease. If it overran and a retry took over, complete()
-                // returns an error here and the takeover's result is the one
-                // served; pick a lease comfortably above backend latency.
-                let _ = self.engine.complete(token, to_outcome(&response));
-                self.metrics.created += 1;
-                tag(response, "created")
-            }
+            Begin::Run(token) => BeginPhase::Forward(ForwardTicket { token: Some(token) }),
             Begin::Replay(outcome) => {
                 self.metrics.replayed += 1;
-                tag(from_outcome(outcome), "replayed")
+                BeginPhase::Done(tag(from_outcome(outcome), "replayed"))
             }
             Begin::InProgress => {
                 self.metrics.in_progress += 1;
-                tagged_status(409, "in-progress")
+                BeginPhase::Done(tagged_status(409, "in-progress"))
             }
             Begin::Mismatch => {
                 self.metrics.mismatch += 1;
-                tagged_status(422, "mismatch")
+                BeginPhase::Done(tagged_status(422, "mismatch"))
             }
         }
     }
 
-    fn pass_through(&mut self, request: &Request) -> Response {
-        match self.upstream.forward(request) {
-            Ok(response) => {
+    /// Phase 3 of the request: given the backend's response (or its failure),
+    /// finalize under the lock. Commits the cached outcome for an idempotent
+    /// request, or passes a keyless response straight through.
+    pub fn complete_phase(
+        &mut self,
+        ticket: ForwardTicket,
+        forwarded: std::io::Result<Response>,
+    ) -> Response {
+        match (ticket.token, forwarded) {
+            // Idempotent request, backend answered: cache and serve once.
+            (Some(token), Ok(response)) => {
+                // Exactly-once holds as long as the backend call finished within
+                // the lease. If it overran and a retry took over, complete()
+                // returns an error and the takeover's result is the one served;
+                // pick a lease comfortably above backend latency.
+                let _ = self.engine.complete(token, to_outcome(&response));
+                self.metrics.created += 1;
+                tag(response, "created")
+            }
+            // Idempotent request, backend failed: leave the token in-progress so
+            // its lease lets a later retry take over rather than wedging the key.
+            (Some(_token), Err(_)) => {
+                self.metrics.upstream_error += 1;
+                bad_gateway()
+            }
+            // Keyless passthrough.
+            (None, Ok(response)) => {
                 self.metrics.passthrough += 1;
                 response
             }
-            Err(_) => {
+            (None, Err(_)) => {
                 self.metrics.upstream_error += 1;
                 bad_gateway()
             }
         }
     }
+}
+
+/// The outcome of [`Gateway::begin_phase`]: either a final response, or an
+/// instruction to forward to the backend and then call
+/// [`Gateway::complete_phase`].
+pub enum BeginPhase {
+    /// The response is already determined (replay / 409 / 422); do not forward.
+    Done(Response),
+    /// Forward the request to the backend, then hand this ticket to
+    /// [`complete_phase`](Gateway::complete_phase).
+    Forward(ForwardTicket),
+}
+
+/// Opaque handoff between [`Gateway::begin_phase`] and
+/// [`Gateway::complete_phase`]. Carries the run token for an idempotent request
+/// (or nothing, for a keyless passthrough). Holding it across an unlocked
+/// backend call is what lets the router free the shard lock during the forward.
+pub struct ForwardTicket {
+    token: Option<RunToken>,
 }
 
 /// The path portion of the request target, without any query string. Shared
@@ -488,6 +540,45 @@ mod tests {
         assert!(body.contains("onced_requests_total 3"));
         assert!(body.contains("onced_outcomes_total{outcome=\"created\"} 1"));
         assert!(body.contains("onced_outcomes_total{outcome=\"replayed\"} 1"));
+    }
+
+    /// The two-phase path (used by the router to drop the lock during the
+    /// forward) keeps exactly-once: while one attempt is mid-forward, a
+    /// concurrent same-key request is told to wait (409) rather than forwarded
+    /// again; after completion, retries replay.
+    #[test]
+    fn begin_and_complete_phases_serialise_same_key() {
+        use crate::gateway::BeginPhase;
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut gw = gateway(calls);
+        let req = post(Some("k1"), b"x");
+
+        // Phase 1: first attempt must forward.
+        let ticket = match gw.begin_phase(&req, 1_000) {
+            BeginPhase::Forward(t) => t,
+            BeginPhase::Done(_) => panic!("first attempt should forward"),
+        };
+
+        // Concurrent same-key request while the first is in flight: 409, no forward.
+        match gw.begin_phase(&req, 1_001) {
+            BeginPhase::Done(resp) => assert_eq!(resp.status, 409),
+            BeginPhase::Forward(_) => panic!("in-flight key must not forward twice"),
+        }
+
+        // Phase 3: finish the first attempt with the backend's response.
+        let backend = Response {
+            status: 201,
+            headers: Vec::new(),
+            body: b"charged".to_vec(),
+        };
+        let resp = gw.complete_phase(ticket, Ok(backend));
+        assert_eq!(header(&resp, "Onced-Status"), Some("created"));
+
+        // A later retry now replays the committed outcome.
+        match gw.begin_phase(&req, 1_002) {
+            BeginPhase::Done(resp) => assert_eq!(header(&resp, "Onced-Status"), Some("replayed")),
+            BeginPhase::Forward(_) => panic!("completed key must replay, not forward"),
+        }
     }
 
     #[test]

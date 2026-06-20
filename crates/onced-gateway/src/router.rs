@@ -34,7 +34,7 @@
 //! built with empty rule sets; the router owns all abuse decisions.
 
 use crate::gateway::{
-    health_ok, metrics_response, path_of, too_many_requests, Gateway, Metrics, Upstream,
+    health_ok, metrics_response, path_of, too_many_requests, BeginPhase, Gateway, Metrics, Upstream,
 };
 use crate::http::{Request, Response};
 use crate::server::Handle;
@@ -55,6 +55,10 @@ pub struct Router<S: Store, U: Upstream> {
     /// Abuse rule sets, indexed by `hash(client-identity) % abuse.len()`, so an
     /// IP's whole traffic lands on one rule set and limits stay global.
     abuse: Vec<Mutex<RuleSet>>,
+    /// The shared backend client. The router forwards through this **without**
+    /// holding any shard lock, so a slow backend call never blocks other keys on
+    /// the same shard. Stateless (a fresh connection per request), hence shared.
+    upstream: U,
     /// Requests rejected by the abuse stage (counted here, not in any shard).
     denied: AtomicU64,
     /// Rotating cursor for keyless requests, which carry no idempotency state and
@@ -70,14 +74,18 @@ impl<S: Store, U: Upstream> Router<S, U> {
     /// router owns abuse, so a shard's own rules would double-count. `abuse` is
     /// the IP-sharded rule sets; it need not be the same length as `shards`.
     ///
+    /// `upstream` is the shared backend client the router forwards through with
+    /// no shard lock held.
+    ///
     /// # Panics
     /// If either `shards` or `abuse` is empty.
-    pub fn new(shards: Vec<Gateway<S, U>>, abuse: Vec<RuleSet>) -> Self {
+    pub fn new(shards: Vec<Gateway<S, U>>, abuse: Vec<RuleSet>, upstream: U) -> Self {
         assert!(!shards.is_empty(), "router needs at least one shard");
         assert!(!abuse.is_empty(), "router needs at least one abuse shard");
         Router {
             shards: shards.into_iter().map(Mutex::new).collect(),
             abuse: abuse.into_iter().map(Mutex::new).collect(),
+            upstream,
             denied: AtomicU64::new(0),
             next_shard: AtomicUsize::new(0),
         }
@@ -110,7 +118,7 @@ impl<S: Store, U: Upstream> Router<S, U> {
 impl<S, U> Handle for Router<S, U>
 where
     S: Store + Send,
-    U: Upstream + Send,
+    U: Upstream + Send + Sync,
 {
     fn handle(&self, request: &Request, now_ms: u64) -> Response {
         // 1. Operational endpoints are answered by the router itself, before any
@@ -141,10 +149,28 @@ where
             Some(key) => self.shard_for_key(key),
             None => self.next_shard.fetch_add(1, Ordering::Relaxed) % self.shards.len(),
         };
+
+        // Phase 1 — under the shard lock, decide. Drop the lock immediately after.
+        let ticket = {
+            let mut shard = self.shards[shard_idx]
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            match shard.begin_phase(request, now_ms) {
+                BeginPhase::Done(response) => return response,
+                BeginPhase::Forward(ticket) => ticket,
+            }
+        };
+
+        // Phase 2 — the slow backend call, with **no shard lock held**, so other
+        // keys on this shard run in parallel and a concurrent same-key retry sees
+        // InProgress and is told to wait.
+        let forwarded = self.upstream.forward(request);
+
+        // Phase 3 — re-acquire the lock only to commit the outcome.
         let mut shard = self.shards[shard_idx]
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        shard.handle_after_abuse(request, now_ms)
+        shard.complete_phase(ticket, forwarded)
     }
 }
 
@@ -204,7 +230,12 @@ mod tests {
                 )
             })
             .collect();
-        Router::new(shards, abuse)
+        // The router forwards through its own shared upstream (same call counter),
+        // not the shards' — they exist only to hold per-shard idempotency state.
+        let upstream = CountingUpstream {
+            calls: Arc::clone(&calls),
+        };
+        Router::new(shards, abuse, upstream)
     }
 
     fn post(key: Option<&str>, ip: &str, body: &[u8]) -> Request {
