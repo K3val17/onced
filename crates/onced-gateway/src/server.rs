@@ -141,11 +141,20 @@ mod tests {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 backend_hits.fetch_add(1, Ordering::SeqCst);
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(500)))
-                    .ok();
-                let mut scratch = [0u8; 1024];
-                let _ = stream.read(&mut scratch); // best-effort drain of the request
+                // Read until the end of the request headers before responding, so
+                // the backend never closes the connection while the (possibly
+                // descheduled) gateway is still writing the request — which would
+                // break the pipe and surface as a spurious 502. A generous timeout
+                // keeps a genuinely stuck peer from wedging the thread.
+                stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut byte) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => request.push(byte[0]),
+                    }
+                }
                 let _ = stream.write_all(
                     b"HTTP/1.1 201 Created\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncharged",
                 );
