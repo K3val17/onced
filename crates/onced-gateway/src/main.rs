@@ -1,9 +1,16 @@
 //! The Onced gateway binary.
 //!
+//! Runs a [`Router`](onced_gateway::router::Router): `N` independent
+//! idempotency shards (one per core by default), each with its own engine and
+//! write-ahead log, plus a global IP-sharded abuse stage. Requests for different
+//! keys run in parallel; requests for the same key always hit the same shard, so
+//! exactly-once holds.
+//!
 //! Configured via environment variables:
-//!   - `ONCED_LISTEN`  — address to listen on   (default `127.0.0.1:8080`)
-//!   - `ONCED_BACKEND` — backend to forward to   (default `127.0.0.1:9000`)
-//!   - `ONCED_WAL`     — write-ahead log path     (default `onced.wal`)
+//!   - `ONCED_LISTEN`  — address to listen on (default `127.0.0.1:8080`)
+//!   - `ONCED_BACKEND` — backend to forward to (default `127.0.0.1:9000`)
+//!   - `ONCED_WAL`     — WAL path prefix; shard `i` uses `<prefix>.<i>.wal` (default `onced`)
+//!   - `ONCED_SHARDS`  — shard count (default: CPU count)
 //!
 //! Run: `ONCED_BACKEND=127.0.0.1:9000 cargo run -p onced-gateway`
 
@@ -11,31 +18,61 @@ use onced_core::abuse::{Action, RuleSet};
 use onced_core::engine::Engine;
 use onced_core::wal::WalStore;
 use onced_gateway::gateway::Gateway;
+use onced_gateway::router::Router;
 use onced_gateway::server::{serve, HttpUpstream};
 use std::net::TcpListener;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread::available_parallelism;
 
 const LEASE_MS: u64 = 30_000;
 
 fn main() -> std::io::Result<()> {
     let listen = env_or("ONCED_LISTEN", "127.0.0.1:8080");
     let backend = env_or("ONCED_BACKEND", "127.0.0.1:9000");
-    let wal_path = env_or("ONCED_WAL", "onced.wal");
+    let wal_prefix = env_or("ONCED_WAL", "onced");
+    let shard_count = env_shards();
 
-    let store = WalStore::open(Path::new(&wal_path))?;
-    let rules = RuleSet::new().rule("per-ip-per-second", 1_000, 50, Action::Throttle);
-    let gateway = Arc::new(Mutex::new(Gateway::new(
-        Engine::new(store, LEASE_MS),
-        rules,
-        HttpUpstream::new(backend.clone()),
-    )));
+    // One idempotency shard per slot: its own engine over its own WAL file, and
+    // an empty rule set (the router owns abuse, so a shard's own rules would
+    // double-count). Same backend address for all — `HttpUpstream` opens a fresh
+    // connection per request, so it is safe to share by value.
+    let mut shards = Vec::with_capacity(shard_count);
+    for i in 0..shard_count {
+        let wal_path = PathBuf::from(format!("{wal_prefix}.{i}.wal"));
+        let store = WalStore::open(&wal_path)?;
+        shards.push(Gateway::new(
+            Engine::new(store, LEASE_MS),
+            RuleSet::new(),
+            HttpUpstream::new(backend.clone()),
+        ));
+    }
+
+    // The abuse stage, sharded by client IP so per-IP limits stay global. One
+    // rule set per shard slot, each carrying the same policy.
+    let abuse = (0..shard_count)
+        .map(|_| RuleSet::new().rule("per-ip-per-second", 1_000, 50, Action::Throttle))
+        .collect();
+
+    let router = Arc::new(Router::new(shards, abuse));
 
     let listener = TcpListener::bind(&listen)?;
-    eprintln!("onced: listening on {listen}, forwarding to {backend}, wal at {wal_path}");
-    serve(listener, gateway)
+    eprintln!(
+        "onced: listening on {listen}, forwarding to {backend}, \
+         {shard_count} shards at {wal_prefix}.<i>.wal"
+    );
+    serve(listener, router)
 }
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Shard count from `ONCED_SHARDS`, else the machine's CPU count, else 1.
+fn env_shards() -> usize {
+    std::env::var("ONCED_SHARDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| available_parallelism().map(|n| n.get()).unwrap_or(1))
 }

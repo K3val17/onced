@@ -62,41 +62,54 @@ impl Upstream for HttpUpstream {
     }
 }
 
-/// Run the accept loop, handling each connection on its own thread. The gateway
-/// state is shared behind a `Mutex`.
-pub fn serve<S, U>(listener: TcpListener, gateway: Arc<Mutex<Gateway<S, U>>>) -> std::io::Result<()>
+/// A request handler the transport can drive concurrently from many threads.
+///
+/// Takes `&self` so each implementation owns its interior locking: a single
+/// [`Gateway`] behind a `Mutex` (one shard), or the sharded
+/// [`Router`](crate::router::Router), which holds a lock per shard and so lets
+/// requests for different keys run in parallel.
+pub trait Handle: Send + Sync {
+    /// Produce the response for one request, observed at `now_ms`.
+    fn handle(&self, request: &Request, now_ms: u64) -> Response;
+}
+
+/// A single-shard handler: serialize every request on one lock.
+impl<S, U> Handle for Mutex<Gateway<S, U>>
 where
-    S: Store + Send + 'static,
-    U: Upstream + Send + 'static,
+    S: Store + Send,
+    U: Upstream + Send,
+{
+    fn handle(&self, request: &Request, now_ms: u64) -> Response {
+        // Recover a poisoned lock rather than propagating another thread's panic.
+        let mut gateway = self.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        gateway.handle(request, now_ms)
+    }
+}
+
+/// Run the accept loop, handling each connection on its own thread. The handler
+/// is shared behind an `Arc` and manages its own locking.
+pub fn serve<H>(listener: TcpListener, handler: Arc<H>) -> std::io::Result<()>
+where
+    H: Handle + 'static,
 {
     for stream in listener.incoming() {
         let stream = stream?;
-        let gateway = Arc::clone(&gateway);
+        let handler = Arc::clone(&handler);
         std::thread::spawn(move || {
-            let _ = handle_connection(stream, &gateway);
+            let _ = handle_connection(stream, handler.as_ref());
         });
     }
     Ok(())
 }
 
-fn handle_connection<S, U>(stream: TcpStream, gateway: &Mutex<Gateway<S, U>>) -> std::io::Result<()>
-where
-    S: Store,
-    U: Upstream,
-{
+fn handle_connection<H: Handle>(stream: TcpStream, handler: &H) -> std::io::Result<()> {
     stream.set_read_timeout(Some(SOCKET_TIMEOUT))?;
     stream.set_write_timeout(Some(SOCKET_TIMEOUT))?;
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
     if let Some(request) = parse_request(&mut reader)? {
-        let response = {
-            // Recover a poisoned lock rather than propagating another thread's panic.
-            let mut gateway = gateway
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            gateway.handle(&request, now_ms())
-        };
+        let response = handler.handle(&request, now_ms());
         write_response(&mut writer, &response)?;
         writer.flush()?;
     }

@@ -20,8 +20,9 @@ function you are changing and its callers — not whole modules. Laws live in
 | Abuse / rate limiting | `onced-core/src/abuse.rs` | `SlidingWindowLimiter`, `RuleSet`, `Verdict`, `Action` |
 | Frequency / distinct counts | `onced-core/src/{sketch,hll}.rs` | `CountMinSketch`, `HyperLogLog` |
 | HTTP wire format | `onced-gateway/src/http.rs` | `parse_request`, `write_response`, `Request`, `Response` |
-| Request handling + metrics | `onced-gateway/src/gateway.rs` | `Gateway::handle`, `Metrics`, `Upstream` |
-| TCP server / backend client | `onced-gateway/src/server.rs` | `serve`, `HttpUpstream`, `now_ms` |
+| Request handling + metrics | `onced-gateway/src/gateway.rs` | `Gateway::handle`, `handle_after_abuse`, `Metrics`, `Upstream` |
+| Shard-per-core routing | `onced-gateway/src/router.rs` | `Router`, `shard_for_key`, `abuse_for_identity` |
+| TCP server / backend client | `onced-gateway/src/server.rs` | `serve`, `Handle`, `HttpUpstream`, `now_ms` |
 | Simulation / fault injection | `onced-sim/src/lib.rs` | `Simulation::step`, invariant asserts |
 
 Resolve the concern in this table first, then `rg` the symbol — do not open the file blind.

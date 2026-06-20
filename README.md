@@ -94,7 +94,14 @@ durability contract: acknowledge an operation only *after* `flush`. An operation
 buffered when the process dies is treated as never-acknowledged — the client retries, and
 the retry either replays (if a later op flushed it) or re-runs. Onced's exactly-once
 guarantee on the *acknowledged* outcome is preserved; you simply choose how many commits
-to batch behind one `fsync`. Shard-per-core then scales throughput ~linearly with cores.
+to batch behind one `fsync`.
+
+The gateway binary runs a **shard-per-core router** (one shard per CPU by default): each
+shard is an independent engine + WAL, and requests are routed by `hash(Idempotency-Key)`
+so the same key always lands on the same shard (exactly-once preserved) while different
+keys run in parallel with no shared lock. Abuse limits are routed separately by client IP,
+so per-IP quotas stay global even though idempotency state is sharded. Throughput scales
+~linearly with shard count.
 
 ## Architecture
 
@@ -105,7 +112,7 @@ deterministic-simulation-testable and trivially portable.
 | Crate | Role |
 |---|---|
 | `onced-core` | Pure state machine + abuse primitives (idempotency engine, WAL, sliding-window limiter, Count-Min Sketch, HyperLogLog). No I/O. |
-| `onced-gateway` | Network data plane — hand-rolled HTTP/1.1, wires the engine + abuse rules in front of a backend. Runnable binary. |
+| `onced-gateway` | Network data plane — hand-rolled HTTP/1.1, wires the engine + abuse rules in front of a backend. Runnable binary with a **shard-per-core router**. |
 | `onced-sim` | Deterministic simulation testing: seeded fault injection (crashes, clock jumps, lease takeovers) asserting the invariants after every step. |
 | `onced-bench` | Zero-dependency throughput benchmarks. |
 

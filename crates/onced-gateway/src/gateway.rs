@@ -55,6 +55,20 @@ pub struct Metrics {
 }
 
 impl Metrics {
+    /// Fold another shard's counters into this one. Used by the sharded
+    /// [`Router`](crate::router::Router) to aggregate per-shard metrics into a
+    /// single `/metrics` view.
+    pub fn merge(&mut self, other: &Metrics) {
+        self.requests_total += other.requests_total;
+        self.created += other.created;
+        self.replayed += other.replayed;
+        self.in_progress += other.in_progress;
+        self.mismatch += other.mismatch;
+        self.denied += other.denied;
+        self.upstream_error += other.upstream_error;
+        self.passthrough += other.passthrough;
+    }
+
     /// Render as Prometheus text exposition format.
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -104,7 +118,12 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
         &self.metrics
     }
 
-    /// Handle one request and produce the response to send back to the client.
+    /// Handle one request end to end (operational endpoints, abuse, then
+    /// idempotency) and produce the response to send back to the client. This is
+    /// the single-shard entry point; the sharded [`Router`](crate::router::Router)
+    /// instead runs a shared abuse stage and calls [`handle_after_abuse`].
+    ///
+    /// [`handle_after_abuse`]: Gateway::handle_after_abuse
     pub fn handle(&mut self, request: &Request, now_ms: u64) -> Response {
         // Operational endpoints bypass abuse rules and idempotency entirely: a
         // load balancer must be able to poll liveness without a key or a quota.
@@ -113,16 +132,30 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
             "/metrics" => return metrics_response(&self.metrics),
             _ => {}
         }
-        self.metrics.requests_total += 1;
 
-        // 1. Abuse defense, keyed on the caller's identity.
+        // Abuse defense, keyed on the caller's identity. In the single-shard
+        // case this is the whole abuse stage.
         let identity = request.header("x-forwarded-for").unwrap_or("anonymous");
         if let Verdict::Deny { rule, action } = self.rules.evaluate(identity, now_ms) {
             self.metrics.denied += 1;
             return too_many_requests(&rule, action);
         }
 
-        // 2. Idempotency is opt-in via the Idempotency-Key header (like Stripe).
+        self.handle_after_abuse(request, now_ms)
+    }
+
+    /// The idempotency + passthrough stage, run *after* the abuse check has
+    /// already passed.
+    ///
+    /// The sharded [`Router`](crate::router::Router) calls this directly: it
+    /// runs its own shared, IP-sharded abuse stage before dispatch, so abuse
+    /// counters stay global even though idempotency state is sharded by key.
+    /// `requests_total` counts requests that reached this stage (i.e. were not
+    /// denied); denials are counted separately by whoever ran the abuse stage.
+    pub fn handle_after_abuse(&mut self, request: &Request, now_ms: u64) -> Response {
+        self.metrics.requests_total += 1;
+
+        // Idempotency is opt-in via the Idempotency-Key header (like Stripe).
         let Some(key) = request.header("idempotency-key") else {
             return self.pass_through(request);
         };
@@ -177,12 +210,14 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
     }
 }
 
-/// The path portion of the request target, without any query string.
-fn path_of(request: &Request) -> &str {
+/// The path portion of the request target, without any query string. Shared
+/// with the router, which intercepts operational endpoints before sharding.
+pub(crate) fn path_of(request: &Request) -> &str {
     request.target.split('?').next().unwrap_or(&request.target)
 }
 
-fn health_ok() -> Response {
+/// The `200 ok` liveness response served at `/healthz`.
+pub(crate) fn health_ok() -> Response {
     Response {
         status: 200,
         headers: vec![("Onced-Status".to_string(), "healthy".to_string())],
@@ -190,7 +225,8 @@ fn health_ok() -> Response {
     }
 }
 
-fn metrics_response(metrics: &Metrics) -> Response {
+/// The Prometheus-format response served at `/metrics`.
+pub(crate) fn metrics_response(metrics: &Metrics) -> Response {
     Response {
         status: 200,
         headers: vec![(
@@ -248,7 +284,9 @@ fn tagged_status(code: u16, status: &str) -> Response {
     }
 }
 
-fn too_many_requests(rule: &str, action: Action) -> Response {
+/// The `429` response for a request denied by an abuse rule. Shared with the
+/// router, whose abuse stage produces the same response shape.
+pub(crate) fn too_many_requests(rule: &str, action: Action) -> Response {
     let action = match action {
         Action::Challenge => "challenge",
         Action::Throttle => "throttle",
