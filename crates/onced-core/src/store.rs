@@ -27,6 +27,12 @@ pub trait Store {
     fn max_in_progress_fence(&self) -> u64 {
         0
     }
+
+    /// Make every preceding [`put`](Store::put) durable. For an in-memory store
+    /// this is a no-op; for a group-commit write-ahead log it is the single
+    /// `fsync` that commits a whole batch. A caller that needs durability must
+    /// call this before acknowledging the operation.
+    fn flush(&mut self) {}
 }
 
 /// An in-memory [`Store`] for tests and development.

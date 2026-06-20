@@ -70,6 +70,13 @@ impl<S: Store> Engine<S> {
         }
     }
 
+    /// Make every preceding state change durable (one `fsync` for a group-commit
+    /// store). Call after a batch of `begin`/`complete` and before acknowledging
+    /// those operations to clients.
+    pub fn flush(&mut self) {
+        self.store.flush();
+    }
+
     fn mint_fence(&mut self) -> Fence {
         let fence = Fence(self.next_fence);
         self.next_fence += 1;

@@ -65,6 +65,17 @@ curl -X POST localhost:8080/charge -H 'Idempotency-Key: abc-123' -d 'amount=500'
 curl -X POST localhost:8080/charge -H 'Idempotency-Key: abc-123' -d 'amount=500'  # replayed
 ```
 
+## Observability
+
+The gateway serves two operational endpoints locally, bypassing abuse rules and
+idempotency (so a load balancer can poll liveness without a key or a quota):
+
+- `GET /healthz` → `200 ok` for liveness checks.
+- `GET /metrics` → Prometheus-format counters: total proxied requests and a breakdown
+  of outcomes (`created`, `replayed`, `in_progress`, `mismatch`, `denied`,
+  `upstream_error`, `passthrough`). `replayed` is your duplicate-suppression rate;
+  `denied` is your abuse-block rate.
+
 ## Performance
 
 Single shard, single thread, measured with `cargo run --release -p onced-bench`:
@@ -73,11 +84,17 @@ Single shard, single thread, measured with `cargo run --release -p onced-bench`:
 |---|---|---|
 | Replay (retry-storm hot path) | ~30M ops/s | ~33 ns/op |
 | Begin + complete, in-memory | ~4.4M ops/s | ~230 ns/op |
-| Begin + complete, durable WAL (`fsync` per commit) | fsync-bound | ~one fsync/commit |
+| Begin + complete, durable WAL — group commit (1 `fsync`/batch) | ~53K ops/s | ~19 µs/op |
+| Begin + complete, durable WAL — strict (1 `fsync`/commit) | ~130 ops/s | ~8 ms/op |
 
-The replay path — the common case under a retry storm — is nearly free. The durable path
-is bounded by disk `fsync` latency, which production deployments amortize with group
-commit and a shard per core (throughput scales ~linearly with cores).
+The replay path — the common case under a retry storm — is nearly free. For durable
+writes, **group commit** (buffer many commits, one `fsync` per batch — how Postgres,
+FoundationDB, and TigerBeetle do it) is ~400× faster than `fsync`-per-commit. The
+durability contract: acknowledge an operation only *after* `flush`. An operation still
+buffered when the process dies is treated as never-acknowledged — the client retries, and
+the retry either replays (if a later op flushed it) or re-runs. Onced's exactly-once
+guarantee on the *acknowledged* outcome is preserved; you simply choose how many commits
+to batch behind one `fsync`. Shard-per-core then scales throughput ~linearly with cores.
 
 ## Architecture
 

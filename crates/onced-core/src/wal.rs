@@ -1,10 +1,12 @@
 //! Write-ahead log: crash-safe durability for the idempotency store.
 //!
-//! Every state change is appended to a log file and forced to disk (`fsync`)
-//! *before* it is acknowledged; on restart the log is replayed to rebuild the
-//! in-memory index exactly. This is the classic database durability discipline
-//! (Gray, "The Transaction Concept"). Each record is length-framed and
-//! CRC32-checksummed so a torn or corrupt tail (the signature of a crash
+//! State changes are appended to a log file and forced to disk with `fsync`;
+//! on restart the log is replayed to rebuild the in-memory index exactly. This
+//! is the classic database durability discipline (Gray, "The Transaction
+//! Concept"). Two `fsync` policies are offered (see [`WalStore`]): **strict**
+//! (one `fsync` per write, durable before it returns) and **group commit** (one
+//! `fsync` per [`flush`](Store::flush)ed batch). Each record is length-framed
+//! and CRC32-checksummed so a torn or corrupt tail (the signature of a crash
 //! mid-append) is detected and discarded rather than trusted.
 //!
 //! Records are written with no external dependencies: a small hand-rolled
@@ -181,17 +183,44 @@ pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeySta
 }
 
 /// A durable [`Store`]: an in-memory index kept in lock-step with an append-only
-/// write-ahead log on disk. Reads hit memory; every write is appended and
-/// `fsync`ed before it is acknowledged. On `open` the log is replayed and any
-/// torn or corrupt tail is truncated away.
+/// write-ahead log on disk. Reads hit memory. On `open` the log is replayed and
+/// any torn or corrupt tail is truncated away.
+///
+/// Two durability disciplines, chosen at open time:
+///
+/// - **Strict** ([`WalStore::open`]) — every `put` is appended and `fsync`ed
+///   before it returns. Simplest and safest; bounded by one `fsync` per write.
+/// - **Group commit** ([`WalStore::open_buffered`]) — `put` only buffers the
+///   record in userspace; nothing reaches the file descriptor until an explicit
+///   [`Store::flush`]. One `fsync` then makes a whole batch durable at once, the
+///   way Postgres, FoundationDB, and TigerBeetle amortize disk latency. The
+///   caller MUST `flush` before acknowledging an operation as durable; anything
+///   still in the buffer when the process dies is correctly lost (and, for the
+///   idempotency engine, simply retried and taken over — exactly-once holds).
 pub struct WalStore {
     index: HashMap<IdempotencyKey, KeyState>,
     file: std::fs::File,
+    /// Records appended since the last durable `flush`, not yet on the fd.
+    pending: Vec<u8>,
+    /// Strict mode: `fsync` inside every `put`. Group-commit mode: defer to
+    /// `flush`.
+    sync_each: bool,
 }
 
 impl WalStore {
-    /// Open (creating if absent) the log at `path`, replaying it into memory.
+    /// Open in **strict** mode: one `fsync` per `put`.
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// Open in **group-commit** mode: `put` buffers, `flush` makes the batch
+    /// durable with a single `fsync`. See the type docs for the durability
+    /// contract the caller must honour.
+    pub fn open_buffered(path: &Path) -> std::io::Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    fn open_with(path: &Path, sync_each: bool) -> std::io::Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -214,7 +243,28 @@ impl WalStore {
         file.set_len(offset as u64)?;
         file.seek(SeekFrom::Start(offset as u64))?;
 
-        Ok(Self { index, file })
+        Ok(Self {
+            index,
+            file,
+            pending: Vec::new(),
+            sync_each,
+        })
+    }
+
+    /// Append the buffered batch and `fsync` it. Fail-stop: a write or `fsync`
+    /// error halts rather than acknowledging a non-durable write (standard WAL
+    /// policy; graceful degradation is a later refinement, see the design doc).
+    fn flush_pending(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.file
+            .write_all(&self.pending)
+            .expect("onced WAL: append failed; refusing to continue");
+        self.file
+            .sync_all()
+            .expect("onced WAL: fsync failed; refusing to continue");
+        self.pending.clear();
     }
 }
 
@@ -235,18 +285,18 @@ impl Store for WalStore {
     }
 
     fn put(&mut self, key: IdempotencyKey, state: KeyState) {
-        let framed = encode_record(&key, &state);
-        // Fail-stop durability: if we cannot append and fsync, we must not
-        // pretend the state change happened. Halting is safer than acknowledging
-        // a non-durable write (standard WAL policy; graceful handling is a
-        // later refinement, see the design doc).
-        self.file
-            .write_all(&framed)
-            .expect("onced WAL: append failed; refusing to continue");
-        self.file
-            .sync_all()
-            .expect("onced WAL: fsync failed; refusing to continue");
+        // The record is buffered and the index updated immediately so reads in
+        // this process are consistent. Durability is a separate step: strict
+        // mode forces it now; group-commit mode defers it to the next `flush`.
+        self.pending.extend_from_slice(&encode_record(&key, &state));
         self.index.insert(key, state);
+        if self.sync_each {
+            self.flush_pending();
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_pending();
     }
 }
 
@@ -340,6 +390,72 @@ mod tests {
         // Lifetime 2: reopen the same file and the record must be present.
         let store = WalStore::open(&path).expect("reopen wal");
         assert_eq!(store.get(&key), Some(&state));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Group-commit durability contract: a buffered `put` is NOT durable until
+    /// `flush`. A crash (drop) before flush correctly loses it; a flush makes it
+    /// durable. (Valid in-process because pending bytes are held in userspace and
+    /// never reach the file descriptor until flush.)
+    #[test]
+    fn a_buffered_put_is_durable_only_after_flush() {
+        let path = temp_wal_path("buffered");
+        let key = IdempotencyKey("charge-b".into());
+        let state = completed(201, b"charged");
+
+        // Buffer a put, then "crash" without flushing: it must be lost.
+        {
+            let mut store = WalStore::open_buffered(&path).expect("open buffered");
+            store.put(key.clone(), state.clone());
+            // get() sees it within this process lifetime...
+            assert_eq!(store.get(&key), Some(&state));
+        }
+        let store = WalStore::open(&path).expect("reopen");
+        assert_eq!(
+            store.get(&key),
+            None,
+            "an un-flushed put must not survive a crash"
+        );
+
+        // Now buffer, flush, then crash: it must survive.
+        {
+            let mut store = WalStore::open_buffered(&path).expect("open buffered");
+            store.put(key.clone(), state.clone());
+            store.flush();
+        }
+        let store = WalStore::open(&path).expect("reopen after flush");
+        assert_eq!(store.get(&key), Some(&state), "a flushed put must survive");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Group commit amortizes one `fsync` over a whole batch: many buffered puts
+    /// followed by a single flush all recover.
+    #[test]
+    fn a_whole_batch_recovers_after_one_flush() {
+        let path = temp_wal_path("batch");
+        let states: Vec<(IdempotencyKey, KeyState)> = (0..100)
+            .map(|i| {
+                (
+                    IdempotencyKey(format!("k{i}")),
+                    completed(200, format!("body-{i}").as_bytes()),
+                )
+            })
+            .collect();
+
+        {
+            let mut store = WalStore::open_buffered(&path).expect("open buffered");
+            for (k, s) in &states {
+                store.put(k.clone(), s.clone());
+            }
+            store.flush(); // one fsync for the whole batch
+        }
+
+        let store = WalStore::open(&path).expect("reopen");
+        for (k, s) in &states {
+            assert_eq!(store.get(k), Some(s));
+        }
 
         let _ = std::fs::remove_file(&path);
     }

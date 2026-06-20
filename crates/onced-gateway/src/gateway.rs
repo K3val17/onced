@@ -31,11 +31,61 @@ pub trait Upstream {
     fn forward(&self, request: &Request) -> std::io::Result<Response>;
 }
 
+/// Operational counters the gateway exposes at `/metrics`. Plain `u64`s: the
+/// gateway is driven single-threaded per shard (callers serialise on a lock),
+/// so no atomics are needed.
+#[derive(Debug, Default, Clone)]
+pub struct Metrics {
+    /// Proxied requests (excludes the `/healthz` and `/metrics` endpoints).
+    pub requests_total: u64,
+    /// First attempts that ran the backend once and cached the outcome.
+    pub created: u64,
+    /// Retries served from cache without touching the backend.
+    pub replayed: u64,
+    /// Concurrent duplicates told to retry shortly (`409`).
+    pub in_progress: u64,
+    /// Key reused with a different request (`422`).
+    pub mismatch: u64,
+    /// Requests denied by an abuse rule (`429`).
+    pub denied: u64,
+    /// Backend forwarding failures (`502`).
+    pub upstream_error: u64,
+    /// Requests forwarded straight through (no `Idempotency-Key`).
+    pub passthrough: u64,
+}
+
+impl Metrics {
+    /// Render as Prometheus text exposition format.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# HELP onced_requests_total Proxied requests handled.\n");
+        out.push_str("# TYPE onced_requests_total counter\n");
+        out.push_str(&format!("onced_requests_total {}\n", self.requests_total));
+        out.push_str("# HELP onced_outcomes_total Responses by how they were produced.\n");
+        out.push_str("# TYPE onced_outcomes_total counter\n");
+        for (outcome, n) in [
+            ("created", self.created),
+            ("replayed", self.replayed),
+            ("in_progress", self.in_progress),
+            ("mismatch", self.mismatch),
+            ("denied", self.denied),
+            ("upstream_error", self.upstream_error),
+            ("passthrough", self.passthrough),
+        ] {
+            out.push_str(&format!(
+                "onced_outcomes_total{{outcome=\"{outcome}\"}} {n}\n"
+            ));
+        }
+        out
+    }
+}
+
 /// The Onced gateway: an idempotency engine, abuse rules, and a backend.
 pub struct Gateway<S: Store, U: Upstream> {
     engine: Engine<S>,
     rules: RuleSet,
     upstream: U,
+    metrics: Metrics,
 }
 
 impl<S: Store, U: Upstream> Gateway<S, U> {
@@ -45,14 +95,30 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
             engine,
             rules,
             upstream,
+            metrics: Metrics::default(),
         }
+    }
+
+    /// A snapshot of the operational counters.
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
     }
 
     /// Handle one request and produce the response to send back to the client.
     pub fn handle(&mut self, request: &Request, now_ms: u64) -> Response {
+        // Operational endpoints bypass abuse rules and idempotency entirely: a
+        // load balancer must be able to poll liveness without a key or a quota.
+        match path_of(request) {
+            "/healthz" => return health_ok(),
+            "/metrics" => return metrics_response(&self.metrics),
+            _ => {}
+        }
+        self.metrics.requests_total += 1;
+
         // 1. Abuse defense, keyed on the caller's identity.
         let identity = request.header("x-forwarded-for").unwrap_or("anonymous");
         if let Verdict::Deny { rule, action } = self.rules.evaluate(identity, now_ms) {
+            self.metrics.denied += 1;
             return too_many_requests(&rule, action);
         }
 
@@ -69,25 +135,69 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
                     Ok(response) => response,
                     // Leave the token in-progress: its lease lets a later retry
                     // take over rather than wedging the key forever.
-                    Err(_) => return bad_gateway(),
+                    Err(_) => {
+                        self.metrics.upstream_error += 1;
+                        return bad_gateway();
+                    }
                 };
                 // Exactly-once holds as long as the backend call finishes within
                 // the lease. If it overran and a retry took over, complete()
                 // returns an error here and the takeover's result is the one
                 // served; pick a lease comfortably above backend latency.
                 let _ = self.engine.complete(token, to_outcome(&response));
+                self.metrics.created += 1;
                 tag(response, "created")
             }
-            Begin::Replay(outcome) => tag(from_outcome(outcome), "replayed"),
-            Begin::InProgress => tagged_status(409, "in-progress"),
-            Begin::Mismatch => tagged_status(422, "mismatch"),
+            Begin::Replay(outcome) => {
+                self.metrics.replayed += 1;
+                tag(from_outcome(outcome), "replayed")
+            }
+            Begin::InProgress => {
+                self.metrics.in_progress += 1;
+                tagged_status(409, "in-progress")
+            }
+            Begin::Mismatch => {
+                self.metrics.mismatch += 1;
+                tagged_status(422, "mismatch")
+            }
         }
     }
 
-    fn pass_through(&self, request: &Request) -> Response {
-        self.upstream
-            .forward(request)
-            .unwrap_or_else(|_| bad_gateway())
+    fn pass_through(&mut self, request: &Request) -> Response {
+        match self.upstream.forward(request) {
+            Ok(response) => {
+                self.metrics.passthrough += 1;
+                response
+            }
+            Err(_) => {
+                self.metrics.upstream_error += 1;
+                bad_gateway()
+            }
+        }
+    }
+}
+
+/// The path portion of the request target, without any query string.
+fn path_of(request: &Request) -> &str {
+    request.target.split('?').next().unwrap_or(&request.target)
+}
+
+fn health_ok() -> Response {
+    Response {
+        status: 200,
+        headers: vec![("Onced-Status".to_string(), "healthy".to_string())],
+        body: b"ok".to_vec(),
+    }
+}
+
+fn metrics_response(metrics: &Metrics) -> Response {
+    Response {
+        status: 200,
+        headers: vec![(
+            "Content-Type".to_string(),
+            "text/plain; version=0.0.4".to_string(),
+        )],
+        body: metrics.render().into_bytes(),
     }
 }
 
@@ -276,6 +386,70 @@ mod tests {
         gw.handle(&post(None, b"x"), 1_000);
         gw.handle(&post(None, b"x"), 1_000);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn get(path: &str) -> Request {
+        Request {
+            method: "GET".into(),
+            target: path.into(),
+            headers: vec![("X-Forwarded-For".to_string(), "10.0.0.1".to_string())],
+            body: Vec::new(),
+        }
+    }
+
+    /// `/healthz` answers 200 without a key, without a quota, and without ever
+    /// touching the backend — a load balancer must be able to poll it freely.
+    #[test]
+    fn healthz_is_served_locally_without_touching_the_backend() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut gw = Gateway::new(
+            Engine::new(MemoryStore::new(), 30_000),
+            // A rule that would deny everything if health checks were subject to it.
+            RuleSet::new().rule("strict", 1000, 1, Action::Block),
+            CountingUpstream {
+                calls: calls.clone(),
+                status: 201,
+                body: b"x".to_vec(),
+            },
+        );
+
+        for _ in 0..10 {
+            let resp = gw.handle(&get("/healthz"), 0);
+            assert_eq!(resp.status, 200);
+            assert_eq!(resp.body, b"ok");
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "health checks must not proxy"
+        );
+        assert_eq!(
+            gw.metrics().requests_total,
+            0,
+            "health checks are not proxied requests"
+        );
+    }
+
+    /// `/metrics` reflects what actually happened: one create, one replay.
+    #[test]
+    fn metrics_count_created_and_replayed_outcomes() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut gw = gateway(calls);
+
+        gw.handle(&post(Some("k1"), b"x"), 1_000); // created
+        gw.handle(&post(Some("k1"), b"x"), 1_010); // replayed
+        gw.handle(&post(None, b"x"), 1_020); // passthrough
+
+        let m = gw.metrics();
+        assert_eq!(m.requests_total, 3);
+        assert_eq!(m.created, 1);
+        assert_eq!(m.replayed, 1);
+        assert_eq!(m.passthrough, 1);
+
+        let body = String::from_utf8(gw.handle(&get("/metrics"), 1_030).body).unwrap();
+        assert!(body.contains("onced_requests_total 3"));
+        assert!(body.contains("onced_outcomes_total{outcome=\"created\"} 1"));
+        assert!(body.contains("onced_outcomes_total{outcome=\"replayed\"} 1"));
     }
 
     #[test]
