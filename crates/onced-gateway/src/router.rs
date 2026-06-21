@@ -34,7 +34,8 @@
 //! built with empty rule sets; the router owns all abuse decisions.
 
 use crate::gateway::{
-    health_ok, metrics_response, path_of, too_many_requests, BeginPhase, Gateway, Metrics, Upstream,
+    health_ok, metrics_response, path_of, too_many_requests, BeginPhase, ForwardTicket, Gateway,
+    Metrics, Upstream,
 };
 use crate::http::{Request, Response};
 use crate::server::Handle;
@@ -122,6 +123,100 @@ impl<S: Store, U: Upstream> Router<S, U> {
     fn abuse_for_identity(&self, identity: &str) -> usize {
         hash(identity) % self.abuse.len()
     }
+
+    // --- Stages, shared by the sync ([`Handle`]) and async drivers ---
+
+    /// Answer the operational endpoints (`/healthz`, `/metrics`) the router owns
+    /// itself, before any sharding. `None` if this is a normal request.
+    fn operational_response(&self, request: &Request) -> Option<Response> {
+        match path_of(request) {
+            "/healthz" => Some(health_ok()),
+            // `/metrics` must report the aggregate across shards, not one shard.
+            "/metrics" => Some(metrics_response(&self.aggregate_metrics())),
+            _ => None,
+        }
+    }
+
+    /// The abuse stage, sharded by client identity so each IP's limit is global.
+    /// `Some(429)` if denied (and counted), `None` if allowed.
+    fn deny_if_abusive(&self, request: &Request, now_ms: u64) -> Option<Response> {
+        let identity = request.header("x-forwarded-for").unwrap_or("anonymous");
+        let idx = self.abuse_for_identity(identity);
+        let mut rules = self.abuse[idx].lock().unwrap_or_else(|p| p.into_inner());
+        if let Verdict::Deny { rule, action } = rules.evaluate(identity, now_ms) {
+            self.denied.fetch_add(1, Ordering::Relaxed);
+            Some(too_many_requests(&rule, action))
+        } else {
+            None
+        }
+    }
+
+    /// The idempotency shard a request routes to: by key hash if it carries one
+    /// (same key → same shard, so exactly-once holds), else round-robin.
+    fn route_shard(&self, request: &Request) -> usize {
+        match request.header("idempotency-key") {
+            Some(key) => self.shard_for_key(key),
+            None => self.next_shard.fetch_add(1, Ordering::Relaxed) % self.shards.len(),
+        }
+    }
+
+    /// Phase 1 under the shard lock: either a final response (`Err`) or a ticket
+    /// to forward (`Ok`). The lock is dropped before returning, so the backend
+    /// call happens unlocked.
+    fn begin_on(
+        &self,
+        shard_idx: usize,
+        request: &Request,
+        now_ms: u64,
+    ) -> Result<ForwardTicket, Response> {
+        let mut shard = self.shards[shard_idx]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match shard.begin_phase(request, now_ms) {
+            BeginPhase::Done(response) => Err(response),
+            BeginPhase::Forward(ticket) => Ok(ticket),
+        }
+    }
+
+    /// Phase 3 under the shard lock: commit the backend response (or its failure).
+    fn complete_on(
+        &self,
+        shard_idx: usize,
+        ticket: ForwardTicket,
+        forwarded: std::io::Result<Response>,
+        now_ms: u64,
+    ) -> Response {
+        let mut shard = self.shards[shard_idx]
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        shard.complete_phase(ticket, forwarded, now_ms)
+    }
+
+    /// Drive a request with an **async** backend forward: operational + abuse +
+    /// shard `begin_phase` run synchronously (the shard locks are held only
+    /// briefly, never across an `await`), then `forward` is awaited with no lock
+    /// held, then `complete_phase` commits. This is what the tokio/hyper transport
+    /// uses, so backend calls scale without a thread each. `forward` is invoked
+    /// only when the engine actually needs the backend (not on replay/409/422).
+    pub async fn handle_async<F, Fut>(&self, request: &Request, now_ms: u64, forward: F) -> Response
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<Response>>,
+    {
+        if let Some(response) = self.operational_response(request) {
+            return response;
+        }
+        if let Some(denied) = self.deny_if_abusive(request, now_ms) {
+            return denied;
+        }
+        let shard_idx = self.route_shard(request);
+        let ticket = match self.begin_on(shard_idx, request, now_ms) {
+            Ok(ticket) => ticket,
+            Err(done) => return done,
+        };
+        let forwarded = forward().await;
+        self.complete_on(shard_idx, ticket, forwarded, now_ms)
+    }
 }
 
 impl<S, U> Handle for Router<S, U>
@@ -130,56 +225,20 @@ where
     U: Upstream + Send + Sync,
 {
     fn handle(&self, request: &Request, now_ms: u64) -> Response {
-        // 1. Operational endpoints are answered by the router itself, before any
-        //    sharding — `/metrics` must report the *aggregate*, not one shard.
-        match path_of(request) {
-            "/healthz" => return health_ok(),
-            "/metrics" => return metrics_response(&self.aggregate_metrics()),
-            _ => {}
+        if let Some(response) = self.operational_response(request) {
+            return response;
         }
-
-        // 2. Abuse stage, sharded by client identity so each IP's limit is global.
-        let identity = request.header("x-forwarded-for").unwrap_or("anonymous");
-        let abuse_idx = self.abuse_for_identity(identity);
-        {
-            let mut rules = self.abuse[abuse_idx]
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if let Verdict::Deny { rule, action } = rules.evaluate(identity, now_ms) {
-                self.denied.fetch_add(1, Ordering::Relaxed);
-                return too_many_requests(&rule, action);
-            }
+        if let Some(denied) = self.deny_if_abusive(request, now_ms) {
+            return denied;
         }
-
-        // 3. Idempotency stage, sharded by key. A request with a key always hashes
-        //    to the same shard (so exactly-once holds); a keyless request carries
-        //    no state, so round-robin it to spread load.
-        let shard_idx = match request.header("idempotency-key") {
-            Some(key) => self.shard_for_key(key),
-            None => self.next_shard.fetch_add(1, Ordering::Relaxed) % self.shards.len(),
+        let shard_idx = self.route_shard(request);
+        // Phase 1 (locked) → Phase 2 backend call (unlocked) → Phase 3 (locked).
+        let ticket = match self.begin_on(shard_idx, request, now_ms) {
+            Ok(ticket) => ticket,
+            Err(done) => return done,
         };
-
-        // Phase 1 — under the shard lock, decide. Drop the lock immediately after.
-        let ticket = {
-            let mut shard = self.shards[shard_idx]
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            match shard.begin_phase(request, now_ms) {
-                BeginPhase::Done(response) => return response,
-                BeginPhase::Forward(ticket) => ticket,
-            }
-        };
-
-        // Phase 2 — the slow backend call, with **no shard lock held**, so other
-        // keys on this shard run in parallel and a concurrent same-key retry sees
-        // InProgress and is told to wait.
         let forwarded = self.upstream.forward(request);
-
-        // Phase 3 — re-acquire the lock only to commit the outcome.
-        let mut shard = self.shards[shard_idx]
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        shard.complete_phase(ticket, forwarded, now_ms)
+        self.complete_on(shard_idx, ticket, forwarded, now_ms)
     }
 }
 

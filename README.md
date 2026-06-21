@@ -126,6 +126,7 @@ deterministic-simulation-testable and trivially portable.
 | `onced-gateway` | Network data plane — hand-rolled HTTP/1.1, wires the engine + abuse rules in front of a backend. Runnable binary with a **shard-per-core router**. |
 | `onced-sim` | Deterministic simulation testing: seeded fault injection (crashes, clock jumps, lease takeovers) asserting the invariants after every step. |
 | `onced-bench` | Zero-dependency throughput benchmarks. |
+| `onced-fast` | Optional high-performance async transport (tokio + axum + reqwest): HTTP keep-alive, a connection-pooled backend client, async forwards, TLS to the backend. Reuses the same engine via the two-phase `Router::handle_async`. |
 
 ## Correctness
 
@@ -142,8 +143,15 @@ ONCED_SIM_SEEDS=500 ONCED_SIM_STEPS=4000 cargo run -p onced-sim   # extended soa
 
 ## Dependencies
 
-**None.** The entire workspace builds with the Rust standard library only — no crates.io
-downloads. This keeps it auditable, offline-buildable, and supply-chain-clean.
+**The core is zero-dependency.** `onced-core` (engine, WAL, abuse, sketches), the
+`onced-gateway` HTTP/1.1 reverse proxy, the simulation harness, and the benchmarks all
+build with the Rust standard library only — no crates.io downloads — so the
+correctness-critical code stays auditable, offline-buildable, and supply-chain-clean.
+
+The **optional** `onced-fast` crate is the one exception: it pulls a vetted async stack
+(tokio + axum + reqwest/rustls) for a higher-throughput transport. It is a pure transport
+over the same zero-dependency engine — you can run the zero-dep `onced-gateway` and never
+build it.
 
 ## License
 

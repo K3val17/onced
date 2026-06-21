@@ -23,6 +23,7 @@ function you are changing and its callers — not whole modules. Laws live in
 | Request handling + metrics | `onced-gateway/src/gateway.rs` | `Gateway::handle`, `begin_phase`, `complete_phase`, `Metrics`, `Upstream` |
 | Shard-per-core routing | `onced-gateway/src/router.rs` | `Router`, `shard_for_key`, `abuse_for_identity` |
 | TCP server / backend client | `onced-gateway/src/server.rs` | `serve`, `Handle`, `HttpUpstream`, `now_ms` |
+| Async transport (tokio/axum) | `onced-fast/src/lib.rs` | `Proxy`, `serve_fast`, `forward`; drives `Router::handle_async` |
 | Simulation / fault injection | `onced-sim/src/lib.rs` | `Simulation::step`, invariant asserts |
 
 Resolve the concern in this table first, then `rg` the symbol — do not open the file blind.

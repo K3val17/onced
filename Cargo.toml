@@ -5,6 +5,7 @@ members = [
     "crates/onced-gateway",
     "crates/onced-sim",
     "crates/onced-bench",
+    "crates/onced-fast",
 ]
 
 [workspace.package]

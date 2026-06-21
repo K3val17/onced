@@ -31,6 +31,20 @@ pub trait Upstream {
     fn forward(&self, request: &Request) -> std::io::Result<Response>;
 }
 
+/// An [`Upstream`] that never forwards. For drivers that supply the backend call
+/// out of band — e.g. the async transport, which forwards with its own client
+/// via [`Router::handle_async`](crate::router::Router::handle_async) and so never
+/// invokes the synchronous path.
+pub struct NoopUpstream;
+
+impl Upstream for NoopUpstream {
+    fn forward(&self, _request: &Request) -> std::io::Result<Response> {
+        Err(std::io::Error::other(
+            "NoopUpstream::forward called; use an async driver that forwards out of band",
+        ))
+    }
+}
+
 /// Operational counters the gateway exposes at `/metrics`. Plain `u64`s: the
 /// gateway is driven single-threaded per shard (callers serialise on a lock),
 /// so no atomics are needed.

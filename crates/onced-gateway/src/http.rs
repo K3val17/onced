@@ -10,6 +10,7 @@
 use std::io::{BufRead, Write};
 
 /// A parsed HTTP request.
+#[derive(Clone, Debug)]
 pub struct Request {
     /// Request method, e.g. `POST`.
     pub method: String,
@@ -32,6 +33,7 @@ impl Request {
 }
 
 /// A response to serialize back to the client.
+#[derive(Clone, Debug)]
 pub struct Response {
     /// Status code, e.g. `201`.
     pub status: u16,

@@ -27,9 +27,12 @@ If a change cannot preserve all four, stop and surface the conflict.
   Inject all non-determinism: time enters as `now_ms: u64`. This is what makes core
   deterministic and simulation-testable. Do not add a dependency on the system clock,
   `std::thread`, or RNG to core.
-- **Zero external dependencies.** The whole workspace builds with std only — no crates.io
-  downloads. Hand-roll over pulling a dep. This keeps it auditable, offline-buildable,
-  and supply-chain-clean. Adding any dependency requires explicit human approval.
+- **The core is zero-dependency.** `onced-core`, `onced-gateway`, `onced-sim`, and
+  `onced-bench` build with std only — no crates.io downloads. Hand-roll over pulling a dep
+  there; keep them auditable, offline-buildable, supply-chain-clean. Adding a dependency to
+  any of these requires explicit human approval. The lone sanctioned exception is the
+  **optional** `onced-fast` crate (async transport: tokio/axum/reqwest); deps live there and
+  nowhere else, and it must stay a pure transport over the unchanged core.
 - **Ports and adapters.** Core defines traits (`Store`, `Upstream`); I/O lives in
   adapter crates behind them. Keep the boundary clean so the io_uring/async fast path
   can be swapped in without touching core logic.
