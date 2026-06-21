@@ -186,6 +186,38 @@ pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeySta
     Some((total, key, state))
 }
 
+/// Best-effort `fsync` of `path`'s parent directory, so a `rename` (or first
+/// creation) of the file becomes durable across power loss — the file's data is
+/// already fsync'd; this persists the directory entry. Not every platform /
+/// filesystem supports directory fsync, so a failure here is tolerated rather
+/// than fail-stop (the data is durable regardless).
+fn sync_parent_dir(path: &Path) {
+    let parent = path.parent().unwrap_or(Path::new(""));
+    let dir = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
+/// Whether `buf` begins with a *complete* record frame — the full
+/// `[len][crc][payload]` is present. If a complete frame is present yet
+/// [`decode_record`] still failed, the checksum did not match: that is interior
+/// corruption of a durable record, not a partially-written tail.
+fn is_complete_frame(buf: &[u8]) -> bool {
+    let Some(header) = buf.get(0..8) else {
+        return false;
+    };
+    let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
+    match 8usize.checked_add(len) {
+        Some(total) => buf.len() >= total,
+        None => false,
+    }
+}
+
 /// A durable [`Store`]: an in-memory index kept in lock-step with an append-only
 /// write-ahead log on disk. Reads hit memory. On `open` the log is replayed and
 /// any torn or corrupt tail is truncated away.
@@ -244,8 +276,25 @@ impl WalStore {
             offset += consumed;
         }
 
-        // Drop any torn/corrupt tail past the last valid record and position the
-        // write cursor at the end of durable data, so future appends are clean.
+        // If decoding stopped before the end, decide *why*. A torn tail — the
+        // final record only partially written before a crash — is normal and
+        // recoverable: truncate it away. But a *complete* frame whose checksum
+        // fails is interior corruption of previously-durable data; silently
+        // truncating it (and every record after) is data loss. Surface it loudly
+        // instead (ALICE / RocksDB durability bar).
+        let remaining = &buf[offset..];
+        if !remaining.is_empty() && is_complete_frame(remaining) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "onced WAL: checksum failure on a complete record at offset {offset} \
+                     -- interior corruption, refusing to silently truncate durable data"
+                ),
+            ));
+        }
+
+        // Drop any torn tail past the last valid record and position the write
+        // cursor at the end of durable data, so future appends are clean.
         file.set_len(offset as u64)?;
         file.seek(SeekFrom::Start(offset as u64))?;
 
@@ -342,6 +391,10 @@ impl Store for WalStore {
         }
         std::fs::rename(&tmp, &self.path)
             .expect("onced WAL: atomic rename of compacted log failed; refusing to continue");
+        // Persist the directory entry: the renamed file's *data* is already
+        // fsync'd, but on several filesystems the rename itself can be lost on
+        // power loss unless the parent directory is fsync'd too.
+        sync_parent_dir(&self.path);
 
         // 4. Reopen the live file at the end of the freshly written data. The
         //    pending buffer's records are already reflected in the index (and so
@@ -602,6 +655,36 @@ mod tests {
                 1_000 + lease_ms + 1,
             )
             .unwrap();
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Interior corruption — a flipped byte in the *middle* of the log, with
+    /// fully-durable records after it — must be surfaced, never silently
+    /// truncated. Truncating at the first bad record would discard durable data
+    /// (the ALICE / RocksDB bar: a torn *tail* is recoverable; mid-file checksum
+    /// failure is corruption).
+    #[test]
+    fn interior_corruption_is_surfaced_not_silently_truncated() {
+        let path = temp_wal_path("interior");
+        {
+            let mut store = WalStore::open(&path).unwrap();
+            for i in 0..6u32 {
+                store.put(IdempotencyKey(format!("k{i}")), completed(200, b"x"));
+            }
+        }
+
+        // Flip a byte inside the first record's payload (header is bytes 0..8).
+        // Records after it remain intact, so this is interior corruption.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[9] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let result = WalStore::open(&path);
+        assert!(
+            result.is_err(),
+            "interior corruption must be surfaced as an error, not silently truncated"
+        );
 
         let _ = std::fs::remove_file(&path);
     }

@@ -42,23 +42,43 @@ struct WindowCounter {
     previous: u64,
 }
 
+/// Default cap on the number of distinct keys a limiter tracks, bounding its
+/// memory regardless of how many distinct keys it sees. One `WindowCounter` is a
+/// few words, so ~1M keys is on the order of tens of MB.
+pub const DEFAULT_MAX_KEYS: usize = 1_000_000;
+
 /// A Cloudflare-style sliding-window rate limiter: O(1) memory per key, and
-/// resistant to window-boundary bursting (see module docs).
+/// resistant to window-boundary bursting (see module docs). The number of
+/// tracked keys is hard-capped so a key-rotation flood cannot exhaust memory.
 pub struct SlidingWindowLimiter {
     window_ms: u64,
     limit: u64,
+    max_keys: usize,
     counters: HashMap<String, WindowCounter>,
 }
 
 impl SlidingWindowLimiter {
-    /// Create a limiter allowing up to `limit` hits per trailing `window_ms`.
+    /// Create a limiter allowing up to `limit` hits per trailing `window_ms`,
+    /// tracking up to [`DEFAULT_MAX_KEYS`] distinct keys.
     pub fn new(window_ms: u64, limit: u64) -> Self {
+        Self::with_capacity(window_ms, limit, DEFAULT_MAX_KEYS)
+    }
+
+    /// Create a limiter with an explicit cap on tracked keys.
+    pub fn with_capacity(window_ms: u64, limit: u64, max_keys: usize) -> Self {
         assert!(window_ms > 0, "window_ms must be non-zero");
+        assert!(max_keys > 0, "max_keys must be non-zero");
         Self {
             window_ms,
             limit,
+            max_keys,
             counters: HashMap::new(),
         }
+    }
+
+    /// How many distinct keys are currently tracked (bounded by `max_keys`).
+    pub fn tracked_keys(&self) -> usize {
+        self.counters.len()
     }
 
     /// Record a hit for `key` at `now_ms` and return whether it is within budget.
@@ -67,6 +87,17 @@ impl SlidingWindowLimiter {
         let window_ms = self.window_ms;
         let limit = self.limit;
         let window_index = now_ms / window_ms;
+
+        // Bound memory: before admitting a brand-new key at capacity, evict one
+        // tracked key. Under a key-rotation flood this keeps the map from growing
+        // without bound; an evicted key simply restarts its count — and an
+        // attacker cycling fresh keys never accumulates one anyway, so the
+        // eviction costs the defense nothing.
+        if self.counters.len() >= self.max_keys && !self.counters.contains_key(key) {
+            if let Some(victim) = self.counters.keys().next().cloned() {
+                self.counters.remove(&victim);
+            }
+        }
 
         let counter = self
             .counters
@@ -243,6 +274,23 @@ mod tests {
             }
         }
         assert_eq!(allowed, 5);
+    }
+
+    /// A key-rotation flood (an attacker cycling through millions of distinct
+    /// IPs/cards) must not grow the limiter without bound. Tracked keys stay at
+    /// or below the configured cap.
+    #[test]
+    fn tracked_keys_stay_bounded_under_key_rotation() {
+        let cap = 128;
+        let mut limiter = SlidingWindowLimiter::with_capacity(1000, 5, cap);
+        for i in 0..10_000 {
+            limiter.check(&format!("ip-{i}"), 0);
+        }
+        assert!(
+            limiter.tracked_keys() <= cap,
+            "limiter memory must stay bounded, got {} keys",
+            limiter.tracked_keys()
+        );
     }
 
     #[test]
