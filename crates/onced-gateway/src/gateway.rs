@@ -235,7 +235,17 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
         now_ms: u64,
     ) -> Response {
         match (ticket.token, forwarded) {
-            // Idempotent request, backend answered: cache and serve once.
+            // Idempotent request, backend returned a transient server error (5xx):
+            // do NOT cache it — caching would replay the error to every retry
+            // forever. Leave the key in-progress so the lease lets a retry re-run
+            // it, and serve the 5xx to this caller (Stripe does the same: only
+            // deterministic outcomes are cached).
+            (Some(_token), Ok(response)) if response.status >= 500 => {
+                self.metrics.upstream_error += 1;
+                response
+            }
+            // Idempotent request, backend gave a final answer (<500): cache and
+            // serve once.
             (Some(token), Ok(response)) => {
                 // Exactly-once holds as long as the backend call finished within
                 // the lease. If it overran and a retry took over, complete()
@@ -465,6 +475,41 @@ mod tests {
         assert_eq!(second.status, 201);
         assert_eq!(header(&first, "Onced-Status"), Some("created"));
         assert_eq!(header(&second, "Onced-Status"), Some("replayed"));
+    }
+
+    /// A transient upstream 5xx must NOT be cached — caching it would replay the
+    /// error forever. The key is left retryable, and a retry (after the lease)
+    /// re-forwards rather than replaying the 5xx.
+    #[test]
+    fn upstream_5xx_is_not_cached_and_is_retried() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut gw = Gateway::new(
+            Engine::new(MemoryStore::new(), 1_000),
+            RuleSet::new(),
+            CountingUpstream {
+                calls: calls.clone(),
+                status: 500,
+                body: b"upstream boom".to_vec(),
+            },
+        );
+        let req = post(Some("k"), b"x");
+
+        let first = gw.handle_after_abuse(&req, 1_000);
+        assert_eq!(first.status, 500);
+        assert_ne!(
+            header(&first, "Onced-Status"),
+            Some("created"),
+            "a 5xx must not be committed as the cached outcome"
+        );
+
+        // After the lease expires, a retry must re-run the backend, not replay.
+        let second = gw.handle_after_abuse(&req, 3_000);
+        assert_eq!(second.status, 500);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the backend must be re-forwarded, not replayed from cache"
+        );
     }
 
     #[test]

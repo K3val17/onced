@@ -8,8 +8,9 @@ license.workspace = true
 [dependencies]
 onced-core = { path = "../onced-core" }
 onced-gateway = { path = "../onced-gateway" }
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "signal"] }
-axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time"] }
+# Only routing + fallback are used; drop axum's json/form/multipart/etc.
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2"] }
 
 [dev-dependencies]

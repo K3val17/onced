@@ -25,10 +25,20 @@ use onced_gateway::http::{Request, Response};
 use onced_gateway::router::Router;
 use onced_gateway::server::now_ms;
 use std::sync::Arc;
+use std::time::Duration;
 
-/// Largest request body the proxy will buffer (16 MiB). Bigger requests are
-/// rejected rather than read unbounded into memory.
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// Largest request body the proxy will buffer per request (1 MiB). Idempotency
+/// payloads are tiny; a small cap bounds per-connection memory and the blast
+/// radius of many concurrent large uploads. Bigger requests get `413`.
+const MAX_BODY: usize = 1024 * 1024;
+
+/// Backend connect timeout — fail fast rather than pinning a task on a dead host.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Overall backend request timeout — a slow backend must not hold a shard's lease
+/// (and a task) indefinitely.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an idle pooled backend connection is kept for reuse.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// The async proxy: a sharded [`Router`] plus a pooled backend client.
 pub struct Proxy<S: Store> {
@@ -36,24 +46,45 @@ pub struct Proxy<S: Store> {
     client: reqwest::Client,
     /// Backend base, e.g. `http://127.0.0.1:9000` or `https://api.internal`.
     backend: String,
+    /// Largest request body buffered before forwarding (else `413`).
+    max_body: usize,
 }
 
 impl<S: Store + Send + Sync + 'static> Proxy<S> {
     /// Build a proxy over `router`, forwarding to `backend` (a base URL such as
     /// `http://host:port`). A bare `host:port` is treated as `http://host:port`.
+    /// Uses a pooled client with sensible connect/request timeouts.
     pub fn new(router: Router<S, NoopUpstream>, backend: impl Into<String>) -> Self {
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(64)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .tcp_nodelay(true)
+            // A reverse proxy must not silently follow upstream redirects.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build reqwest client");
+        Self::with_client(router, backend, client, MAX_BODY)
+    }
+
+    /// Build a proxy with an explicit client and body cap (for tests that need
+    /// short timeouts or small limits).
+    pub fn with_client(
+        router: Router<S, NoopUpstream>,
+        backend: impl Into<String>,
+        client: reqwest::Client,
+        max_body: usize,
+    ) -> Self {
         let mut backend = backend.into();
         if !backend.starts_with("http://") && !backend.starts_with("https://") {
             backend = format!("http://{backend}");
         }
-        let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(64)
-            .build()
-            .expect("build reqwest client");
         Self {
             router,
             client,
             backend,
+            max_body,
         }
     }
 
@@ -66,7 +97,7 @@ impl<S: Store + Send + Sync + 'static> Proxy<S> {
     /// backend asynchronously only when needed), and convert the result back.
     async fn dispatch(&self, req: axum::extract::Request) -> axum::response::Response {
         let (parts, body) = req.into_parts();
-        let body = match axum::body::to_bytes(body, MAX_BODY).await {
+        let body = match axum::body::to_bytes(body, self.max_body).await {
             Ok(bytes) => bytes.to_vec(),
             Err(_) => return text_response(413, "request body too large"),
         };
