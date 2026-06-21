@@ -7,6 +7,9 @@ members = [
     "crates/onced-bench",
     "crates/onced-fast",
 ]
+# The fuzz crate (cargo-fuzz / libFuzzer, nightly-only) is excluded so the normal
+# workspace build stays stable-toolchain and dependency-light.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2021"

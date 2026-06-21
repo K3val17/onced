@@ -1,0 +1,31 @@
+[package]
+name = "onced-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+onced-core = { path = "../crates/onced-core" }
+onced-gateway = { path = "../crates/onced-gateway" }
+
+[[bin]]
+name = "decode_record"
+path = "fuzz_targets/decode_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_request"
+path = "fuzz_targets/parse_request.rs"
+test = false
+doc = false
+bench = false
+
+# libFuzzer needs unwinding.
+[profile.release]
+debug = 1

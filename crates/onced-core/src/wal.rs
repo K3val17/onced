@@ -99,7 +99,10 @@ impl<'a> Reader<'a> {
 
 /// Serialize one `(key, state)` into a self-describing, length-framed,
 /// CRC-checksummed record: `[payload_len: u32][crc32: u32][payload]`.
-pub(crate) fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
+///
+/// Exposed (with [`decode_record`]) as the low-level on-disk codec so it can be
+/// fuzzed directly; most callers use [`WalStore`].
+pub fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
     let mut payload = Vec::new();
     put_str(&mut payload, &key.0);
     match state {
@@ -140,8 +143,10 @@ pub(crate) fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
 
 /// Decode one record from the front of `buf`. Returns the number of bytes
 /// consumed plus the record, or `None` if `buf` does not begin with a complete,
-/// checksum-valid record (truncated tail or corruption).
-pub(crate) fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeyState)> {
+/// checksum-valid record (truncated tail or corruption). Must never panic or
+/// over-read on arbitrary input — it parses untrusted on-disk bytes after a
+/// crash. Exposed for fuzzing (see the `fuzz/` crate).
+pub fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeyState)> {
     let header = buf.get(0..8)?;
     let len = u32::from_le_bytes(header[0..4].try_into().ok()?) as usize;
     let crc = u32::from_le_bytes(header[4..8].try_into().ok()?);

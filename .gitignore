@@ -11,3 +11,10 @@
 # cargo-mutants output
 /mutants.out
 /mutants.out.old
+
+# cargo-fuzz artifacts
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/Cargo.lock
