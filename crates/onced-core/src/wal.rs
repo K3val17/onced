@@ -689,6 +689,121 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The checksum is exactly IEEE 802.3 CRC-32 — pinned against the standard
+    /// published check values, so any change to the algorithm is caught (a
+    /// different-but-internally-consistent checksum would still round-trip).
+    #[test]
+    fn crc32_matches_known_ieee_vectors() {
+        assert_eq!(super::crc32(b""), 0x0000_0000);
+        assert_eq!(super::crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(
+            super::crc32(b"The quick brown fox jumps over the lazy dog"),
+            0x414F_A339
+        );
+    }
+
+    /// `Engine::flush` must actually make buffered (group-commit) writes durable:
+    /// without the flush, a drop loses them.
+    #[test]
+    fn engine_flush_persists_buffered_writes() {
+        use crate::engine::{Begin, Engine};
+        let path = temp_wal_path("engine-flush");
+        let key = IdempotencyKey("k".into());
+        let outcome = CachedOutcome {
+            status: 200,
+            headers: BTreeMap::new(),
+            body: b"ok".to_vec(),
+        };
+        {
+            let mut engine = Engine::new(WalStore::open_buffered(&path).unwrap(), 30_000);
+            let token = match engine.begin(key.clone(), RequestFingerprint([1u8; 32]), 1) {
+                Begin::Run(token) => token,
+                other => panic!("expected Run, got {other:?}"),
+            };
+            engine.complete(token, outcome.clone(), 1).unwrap();
+            engine.flush();
+        }
+        let store = WalStore::open(&path).unwrap();
+        assert!(
+            matches!(store.get(&key), Some(KeyState::Completed { .. })),
+            "engine.flush must persist buffered writes"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `prune_expired` keeps a key whose TTL has NOT yet elapsed (boundary: prune
+    /// just before expiry must not drop it).
+    #[test]
+    fn prune_keeps_an_unexpired_key() {
+        use crate::engine::{Begin, Engine};
+        const TTL: u64 = 10_000;
+        let path = temp_wal_path("prune-keep");
+        let key = IdempotencyKey("fresh".into());
+        {
+            let mut engine = Engine::with_ttl(WalStore::open(&path).unwrap(), 30_000, TTL);
+            let token = match engine.begin(key.clone(), RequestFingerprint([1u8; 32]), 1_000) {
+                Begin::Run(token) => token,
+                other => panic!("expected Run, got {other:?}"),
+            };
+            engine
+                .complete(
+                    token,
+                    CachedOutcome {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: b"x".to_vec(),
+                    },
+                    1_000,
+                )
+                .unwrap();
+            // Prune strictly before expiry (now < completed_at + ttl): keep it.
+            engine.prune_expired(1_000 + TTL - 1);
+        }
+        let store = WalStore::open(&path).unwrap();
+        assert!(
+            store.get(&key).is_some(),
+            "a key before its TTL must not be pruned"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `prune_expired` removes a key exactly at its expiry instant (boundary:
+    /// now == completed_at + ttl is expired).
+    #[test]
+    fn prune_removes_a_key_at_its_expiry_instant() {
+        use crate::engine::{Begin, Engine};
+        const TTL: u64 = 10_000;
+        let path = temp_wal_path("prune-boundary");
+        let key = IdempotencyKey("edge".into());
+        {
+            let mut engine = Engine::with_ttl(WalStore::open(&path).unwrap(), 30_000, TTL);
+            let token = match engine.begin(key.clone(), RequestFingerprint([1u8; 32]), 1_000) {
+                Begin::Run(token) => token,
+                other => panic!("expected Run, got {other:?}"),
+            };
+            engine
+                .complete(
+                    token,
+                    CachedOutcome {
+                        status: 200,
+                        headers: BTreeMap::new(),
+                        body: b"x".to_vec(),
+                    },
+                    1_000,
+                )
+                .unwrap();
+            // Prune exactly at expiry (now == completed_at + ttl): expired.
+            engine.prune_expired(1_000 + TTL);
+        }
+        let store = WalStore::open(&path).unwrap();
+        assert_eq!(
+            store.get(&key),
+            None,
+            "a key at its expiry instant must be pruned"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Compaction collapses the dead, superseded records an append-only log
     /// accumulates: hammering one key 200 times then compacting must shrink the
     /// file, and the live value must survive a reopen.

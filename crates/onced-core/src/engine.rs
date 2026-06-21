@@ -361,6 +361,12 @@ mod tests {
         assert!(matches!(engine.begin(k, f, 1_001), Begin::Replay(o) if o == first));
     }
 
+    /// The default completed-key TTL is exactly 24 hours in milliseconds.
+    #[test]
+    fn default_ttl_is_twenty_four_hours() {
+        assert_eq!(crate::engine::DEFAULT_TTL_MS, 86_400_000);
+    }
+
     /// Within its TTL a completed key still replays; once the TTL elapses the key
     /// is recycled, so a brand-new request — even a *different* one reusing the
     /// same key string — gets to Run rather than replaying a stale outcome. This

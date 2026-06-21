@@ -276,6 +276,34 @@ mod tests {
         assert_eq!(allowed, 5);
     }
 
+    /// `tracked_keys` reports the exact number of distinct keys held.
+    #[test]
+    fn tracked_keys_reports_the_exact_count() {
+        let mut limiter = SlidingWindowLimiter::with_capacity(1000, 5, 128);
+        limiter.check("a", 0);
+        limiter.check("b", 0);
+        limiter.check("a", 0); // repeat — still two distinct keys
+        assert_eq!(limiter.tracked_keys(), 2);
+    }
+
+    /// Eviction happens only at capacity, not before: building up to exactly the
+    /// cap evicts nothing, and the next new key keeps the map at the cap.
+    #[test]
+    fn eviction_happens_only_at_capacity() {
+        let cap = 4;
+        let mut limiter = SlidingWindowLimiter::with_capacity(1000, 100, cap);
+        for k in ["a", "b", "c", "d"] {
+            limiter.check(k, 0);
+        }
+        assert_eq!(
+            limiter.tracked_keys(),
+            cap,
+            "no key should be evicted while building up to the cap"
+        );
+        limiter.check("e", 0); // at cap: evicts exactly one to make room
+        assert_eq!(limiter.tracked_keys(), cap, "stays at the cap");
+    }
+
     /// A key-rotation flood (an attacker cycling through millions of distinct
     /// IPs/cards) must not grow the limiter without bound. Tracked keys stay at
     /// or below the configured cap.

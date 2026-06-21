@@ -7,3 +7,7 @@
 *.swp
 .idea/
 .vscode/
+
+# cargo-mutants output
+/mutants.out
+/mutants.out.old

@@ -70,3 +70,35 @@ impl Store for MemoryStore {
         self.keys.retain(|key, state| keep(key, state));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CachedOutcome, RequestFingerprint};
+    use std::collections::BTreeMap;
+
+    fn state() -> KeyState {
+        KeyState::Completed {
+            fingerprint: RequestFingerprint([0u8; 32]),
+            outcome: CachedOutcome {
+                status: 200,
+                headers: BTreeMap::new(),
+                body: Vec::new(),
+            },
+            completed_at_ms: 0,
+        }
+    }
+
+    /// `compact` drops exactly the entries the predicate rejects, keeping the rest.
+    #[test]
+    fn memory_store_compact_drops_rejected_keys() {
+        let mut store = MemoryStore::new();
+        store.put(IdempotencyKey("keep".into()), state());
+        store.put(IdempotencyKey("drop".into()), state());
+
+        store.compact(&mut |key, _| key.0 == "keep");
+
+        assert!(store.get(&IdempotencyKey("keep".into())).is_some());
+        assert!(store.get(&IdempotencyKey("drop".into())).is_none());
+    }
+}
