@@ -7,4 +7,7 @@ license.workspace = true
 
 [dependencies]
 
+# Dev-only. proptest (property-based testing with shrinking) does NOT affect the
+# zero runtime-dependency guarantee: the shipped library still builds std-only.
 [dev-dependencies]
+proptest = "1"

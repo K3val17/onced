@@ -25,6 +25,9 @@ pub mod sketch;
 pub mod store;
 pub mod wal;
 
+#[cfg(test)]
+mod proptests;
+
 use std::collections::BTreeMap;
 
 /// A client-supplied idempotency key — e.g. the value of an `Idempotency-Key`

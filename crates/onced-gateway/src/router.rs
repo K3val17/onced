@@ -350,6 +350,59 @@ mod tests {
         );
     }
 
+    /// Concurrency stress (matklad-style real-thread test, complementing the
+    /// deterministic sim): 64 threads hammer the SAME key at once through the
+    /// real `Router::handle` (which drops the shard lock during the forward).
+    /// Across every interleaving the backend is hit exactly once, exactly one
+    /// request is `created`, and the rest replay or are told to wait. Repeated to
+    /// shake out timing.
+    #[test]
+    fn concurrent_same_key_hits_backend_once_under_contention() {
+        use std::thread;
+        for _ in 0..25 {
+            let calls = Arc::new(AtomicU32::new(0));
+            let router = Arc::new(router(8, Arc::clone(&calls), vec![RuleSet::new()]));
+
+            let results: Vec<(u16, Option<String>)> = (0..64)
+                .map(|_| {
+                    let r = Arc::clone(&router);
+                    thread::spawn(move || {
+                        let resp = r.handle(&post(Some("hot"), "10.0.0.1", b"x"), 1_000);
+                        (
+                            resp.status,
+                            header(&resp, "Onced-Status").map(str::to_string),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect();
+
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "backend must be hit exactly once under contention"
+            );
+            let created = results
+                .iter()
+                .filter(|(_, s)| s.as_deref() == Some("created"))
+                .count();
+            assert_eq!(created, 1, "exactly one request creates the outcome");
+            for (status, tag) in &results {
+                assert!(
+                    matches!(
+                        (status, tag.as_deref()),
+                        (201, Some("created"))
+                            | (201, Some("replayed"))
+                            | (409, Some("in-progress"))
+                    ),
+                    "unexpected response: {status} {tag:?}"
+                );
+            }
+        }
+    }
+
     /// Abuse limits stay global even though idempotency is sharded by key: one IP
     /// hammering many *different* keys (which scatter across shards) is still
     /// blocked once its global quota is exceeded.

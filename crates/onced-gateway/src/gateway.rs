@@ -563,6 +563,69 @@ mod tests {
         assert!(body.contains("onced_outcomes_total{outcome=\"replayed\"} 1"));
     }
 
+    /// THE lease-takeover hazard (the routing researcher's "Race A"): worker W1
+    /// gets a forward ticket, stalls past its lease; W2 retries, takes over with a
+    /// fresh fence, and completes. W1's late completion carries a STALE fence and
+    /// must be refused — the durably stored / replayed outcome is exactly W2's,
+    /// never W1's. This makes the "lease must exceed backend latency" comment a
+    /// *checked* property, deterministically, via injected `now_ms`.
+    #[test]
+    fn stale_fence_after_lease_takeover_commits_only_the_survivors_outcome() {
+        use crate::gateway::BeginPhase;
+        let calls = Arc::new(AtomicU32::new(0));
+        // Short lease so a clock jump expires it.
+        let mut gw = Gateway::new(
+            Engine::new(MemoryStore::new(), 1_000),
+            RuleSet::new(),
+            CountingUpstream {
+                calls,
+                status: 201,
+                body: Vec::new(),
+            },
+        );
+        let req = post(Some("k"), b"x");
+
+        // W1 begins (gets a forward ticket) but stalls.
+        let w1_ticket = match gw.begin_phase(&req, 1_000) {
+            BeginPhase::Forward(ticket) => ticket,
+            BeginPhase::Done(_) => panic!("first attempt should forward"),
+        };
+        // Clock passes the lease; W2 retries and takes over with a fresh fence.
+        let w2_ticket = match gw.begin_phase(&req, 2_500) {
+            BeginPhase::Forward(ticket) => ticket,
+            BeginPhase::Done(_) => panic!("expired lease should allow takeover"),
+        };
+
+        // W2 finishes first and commits its outcome.
+        let w2 = Response {
+            status: 201,
+            headers: Vec::new(),
+            body: b"w2".to_vec(),
+        };
+        assert_eq!(
+            header(&gw.complete_phase(w2_ticket, Ok(w2), 2_500), "Onced-Status"),
+            Some("created")
+        );
+
+        // W1 finishes late with a now-stale fence. Its complete is refused; the
+        // stored outcome must remain W2's.
+        let w1 = Response {
+            status: 201,
+            headers: Vec::new(),
+            body: b"w1".to_vec(),
+        };
+        gw.complete_phase(w1_ticket, Ok(w1), 2_600);
+
+        // A later retry replays exactly W2's outcome — never the stale W1's.
+        match gw.begin_phase(&req, 2_700) {
+            BeginPhase::Done(resp) => {
+                assert_eq!(resp.body, b"w2", "stale W1 outcome must not be stored");
+                assert_eq!(header(&resp, "Onced-Status"), Some("replayed"));
+            }
+            BeginPhase::Forward(_) => panic!("completed key must replay"),
+        }
+    }
+
     /// The two-phase path (used by the router to drop the lock during the
     /// forward) keeps exactly-once: while one attempt is mid-forward, a
     /// concurrent same-key request is told to wait (409) rather than forwarded
