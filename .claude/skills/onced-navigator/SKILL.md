@@ -25,6 +25,8 @@ function you are changing and its callers — not whole modules. Laws live in
 | TCP server / backend client | `onced-gateway/src/server.rs` | `serve`, `Handle`, `HttpUpstream`, `now_ms` |
 | Async transport (tokio/axum) | `onced-fast/src/lib.rs` | `Proxy`, `serve_fast`, `forward`; drives `Router::handle_async` |
 | Simulation / fault injection | `onced-sim/src/lib.rs` | `Simulation::step`, invariant asserts |
+| Property-based tests | `onced-core/src/proptests.rs` | round-trip, decoder robustness, sketch/HLL bounds |
+| Fuzz targets (nightly) | `fuzz/fuzz_targets/` | `decode_record`, `parse_request` |
 
 Resolve the concern in this table first, then `rg` the symbol — do not open the file blind.
 
