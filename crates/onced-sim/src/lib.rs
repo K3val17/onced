@@ -79,6 +79,9 @@ pub struct Stats {
     /// Completions of an orphaned token whose begin was lost on a pre-flush
     /// crash (buffered mode only) — refused with `Unknown`, never a double effect.
     pub unknown_completes: u64,
+    /// Begins that hit a live key bearing a *different* request fingerprint —
+    /// correctly rejected, never served a wrong replay.
+    pub mismatches: u64,
 }
 
 impl Stats {
@@ -95,6 +98,7 @@ impl Stats {
         self.takeovers += other.takeovers;
         self.flushes += other.flushes;
         self.unknown_completes += other.unknown_completes;
+        self.mismatches += other.mismatches;
     }
 }
 
@@ -115,6 +119,8 @@ struct Inflight {
     index: u64,
     token: RunToken,
     outcome: CachedOutcome,
+    /// Which of the two fingerprints (0 or 1) this worker presented.
+    fp_variant: u8,
 }
 
 /// One simulation run, seeded and self-contained (its own WAL file).
@@ -134,6 +140,10 @@ pub struct Simulation {
     /// asserted never to change (the durable exactly-once invariant). In strict
     /// mode a completion is durable immediately, so this mirrors `committed`.
     durable: HashMap<u64, CachedOutcome>,
+    /// Oracle: which fingerprint variant produced the committed outcome for a
+    /// key. A replay must only ever be served to the *same* fingerprint; a
+    /// different one must be a `Mismatch`, never a wrong replay.
+    committed_fp: HashMap<u64, u8>,
     /// Oracle: count of successful completions per key index. In strict mode this
     /// must stay <= 1; in group-commit mode a lost completion may be retried, so
     /// it is not asserted on.
@@ -147,11 +157,13 @@ fn key_of(index: u64) -> IdempotencyKey {
     IdempotencyKey(format!("key-{index}"))
 }
 
-/// A stable fingerprint per key, so the simulation never produces spurious
-/// mismatches (mismatch behaviour is covered by the engine's unit tests).
-fn fingerprint_of(index: u64) -> RequestFingerprint {
+/// One of two stable fingerprints per key (selected by `variant` 0/1), so the
+/// simulation exercises the `Mismatch` path — a key reused with a *different*
+/// request — under the full fault schedule, not just in unit tests.
+fn fingerprint_of(index: u64, variant: u8) -> RequestFingerprint {
     let mut bytes = [0u8; 32];
     bytes[..8].copy_from_slice(&index.to_le_bytes());
+    bytes[8] = variant;
     RequestFingerprint(bytes)
 }
 
@@ -183,6 +195,7 @@ impl Simulation {
             inflight: Vec::new(),
             committed: HashMap::new(),
             durable: HashMap::new(),
+            committed_fp: HashMap::new(),
             successful_completes: HashMap::new(),
             next_body: 0,
             stats: Stats::default(),
@@ -270,7 +283,15 @@ impl Simulation {
     fn do_begin(&mut self) {
         let index = self.rng.below(KEY_SPACE);
         let key = key_of(index);
-        let fingerprint = fingerprint_of(index);
+        // Vary the request fingerprint in strict mode to exercise the Mismatch
+        // path under faults. Group-commit keeps a fixed fingerprint so its
+        // durable-exactly-once oracle stays simple.
+        let variant = if self.mode == Durability::Strict {
+            self.rng.below(2) as u8
+        } else {
+            0
+        };
+        let fingerprint = fingerprint_of(index, variant);
         let had_inflight = self.inflight.iter().any(|w| w.index == index);
 
         match self.engine.begin(key, fingerprint, self.now_ms) {
@@ -286,6 +307,7 @@ impl Simulation {
                     index,
                     token,
                     outcome,
+                    fp_variant: variant,
                 });
             }
             Begin::Replay(outcome) => {
@@ -296,14 +318,20 @@ impl Simulation {
                     "seed {}: replay returned an outcome the oracle never committed for key {index}",
                     self.seed
                 );
+                // Mismatch safety: a replay is served ONLY to the fingerprint that
+                // produced it — never across a different request.
+                assert_eq!(
+                    self.committed_fp.get(&index),
+                    Some(&variant),
+                    "seed {}: key {index} replayed across a DIFFERENT fingerprint \
+                     -- mismatch safety is violated",
+                    self.seed
+                );
             }
             Begin::InProgress => self.stats.in_progress += 1,
-            Begin::Mismatch => {
-                panic!(
-                    "seed {}: unexpected Mismatch (fingerprints are fixed per key)",
-                    self.seed
-                )
-            }
+            // A different fingerprint hit a live key: correctly refused, never
+            // served a stale replay.
+            Begin::Mismatch => self.stats.mismatches += 1,
         }
     }
 
@@ -322,6 +350,7 @@ impl Simulation {
             Ok(()) => {
                 self.stats.completes_ok += 1;
                 self.committed.insert(index, worker.outcome.clone());
+                self.committed_fp.insert(index, worker.fp_variant);
                 match self.mode {
                     Durability::Strict => {
                         // Durable immediately, so a key completes at most once.
@@ -403,7 +432,11 @@ impl Simulation {
             .map(|(index, outcome)| (*index, outcome.clone()))
             .collect();
         for (index, expected) in committed {
-            match self.engine.begin(key_of(index), fingerprint_of(index), self.now_ms) {
+            let variant = self.committed_fp.get(&index).copied().unwrap_or(0);
+            match self
+                .engine
+                .begin(key_of(index), fingerprint_of(index, variant), self.now_ms)
+            {
                 Begin::Replay(got) => assert_eq!(
                     got, expected,
                     "seed {}: durability violated -- key {index} replayed the wrong outcome after crash",
@@ -467,6 +500,10 @@ mod tests {
         assert!(
             total.stale_fences > 0,
             "campaign never refused a stale fence: {total:?}"
+        );
+        assert!(
+            total.mismatches > 0,
+            "campaign never exercised a fingerprint mismatch: {total:?}"
         );
 
         eprintln!("DST campaign held all invariants: {total:?}");
