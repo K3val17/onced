@@ -1,0 +1,14 @@
+[package]
+name = "onced-uring"
+version = "0.0.0"
+description = "Linux-only io_uring thread-per-core transport for Onced, built on monoio. Excluded from the workspace so the stable cross-platform build is unaffected."
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+monoio = "0.2"
+
+[[bin]]
+name = "onced-uring"
+path = "src/main.rs"

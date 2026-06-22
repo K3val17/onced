@@ -1,0 +1,40 @@
+name: iouring
+
+# The io_uring transport (onced-uring, monoio) is Linux-only and excluded from
+# the workspace, so it gets its own Linux-only CI lane.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Kernel info (io_uring needs Linux >= 5.6)
+        run: uname -r
+
+      - name: Build io_uring transport
+        run: cargo build --release --manifest-path crates/onced-uring/Cargo.toml
+
+      - name: Smoke test — serve over io_uring and fetch
+        run: |
+          ONCED_LISTEN=127.0.0.1:8080 \
+            ./crates/onced-uring/target/release/onced-uring &
+          server=$!
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:8080/ >/tmp/out 2>/dev/null && break
+            sleep 0.2
+          done
+          kill "$server" 2>/dev/null || true
+          grep -q ok /tmp/out && echo "io_uring server responded OK"
