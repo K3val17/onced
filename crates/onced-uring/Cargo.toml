@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 monoio = "0.2"
+onced-core = { path = "../onced-core" }
+onced-gateway = { path = "../onced-gateway" }
 
 [[bin]]
 name = "onced-uring"

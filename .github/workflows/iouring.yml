@@ -11,7 +11,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build-and-smoke:
+  build-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,14 +27,46 @@ jobs:
       - name: Build io_uring transport
         run: cargo build --release --manifest-path crates/onced-uring/Cargo.toml
 
-      - name: Smoke test — serve over io_uring and fetch
+      - name: Exactly-once over the io_uring transport
         run: |
-          ONCED_LISTEN=127.0.0.1:8080 \
+          set -euo pipefail
+          # Backend that counts hits and returns 201.
+          python3 - 9000 <<'PY' &
+          import http.server, sys
+          hits = 0
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  global hits; hits += 1
+                  self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                  b = b'charged'
+                  self.send_response(201)
+                  self.send_header('Content-Length', str(len(b)))
+                  self.end_headers()
+                  self.wfile.write(b)
+              def log_message(self, *a): pass
+          http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), H).serve_forever()
+          PY
+          backend=$!
+
+          ONCED_LISTEN=127.0.0.1:8080 ONCED_BACKEND=127.0.0.1:9000 \
             ./crates/onced-uring/target/release/onced-uring &
           server=$!
-          for _ in $(seq 1 30); do
-            curl -fsS --max-time 2 http://127.0.0.1:8080/ >/tmp/out 2>/dev/null && break
+
+          # Wait for the io_uring server to accept.
+          for _ in $(seq 1 50); do
+            curl -fsS --max-time 2 -X POST http://127.0.0.1:8080/charge \
+              -H 'Idempotency-Key: warmup' -d 'x' >/dev/null 2>&1 && break
             sleep 0.2
           done
-          kill "$server" 2>/dev/null || true
-          grep -q ok /tmp/out && echo "io_uring server responded OK"
+
+          first=$(curl -s -i -X POST http://127.0.0.1:8080/charge -H 'Idempotency-Key: k1' -d 'amount=500')
+          second=$(curl -s -i -X POST http://127.0.0.1:8080/charge -H 'Idempotency-Key: k1' -d 'amount=500')
+
+          kill "$server" "$backend" 2>/dev/null || true
+
+          echo "--- first ---"; echo "$first" | grep -i 'onced-status' || true
+          echo "--- second ---"; echo "$second" | grep -i 'onced-status' || true
+
+          echo "$first"  | grep -qi 'Onced-Status: created'  || { echo "FAIL: first not created"; exit 1; }
+          echo "$second" | grep -qi 'Onced-Status: replayed' || { echo "FAIL: retry not replayed"; exit 1; }
+          echo "io_uring transport holds exactly-once: created then replayed"
