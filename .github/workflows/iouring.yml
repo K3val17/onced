@@ -98,12 +98,14 @@ jobs:
           # gateway hot path), so this measures request handling over io_uring.
           curl -s -X POST http://127.0.0.1:8080/charge -H 'Idempotency-Key: bench-key' \
             --data-binary @/tmp/body >/dev/null || true
-          echo "=== ApacheBench: replay path over io_uring, keep-alive ==="
-          ab -k -n 50000 -c 50 \
+          echo "=== ApacheBench: replay path over io_uring (4 cores) ==="
+          # No -k: ab opens a fresh connection per request (HTTP/1.0), which the
+          # server handles cleanly. Exercises accept + read + route + write over
+          # io_uring end to end; every request after the first is a pure replay.
+          ab -n 50000 -c 50 \
              -H 'Idempotency-Key: bench-key' \
              -T 'application/x-www-form-urlencoded' \
              -p /tmp/body \
              http://127.0.0.1:8080/charge > /tmp/ab.txt 2>&1 || true
-          # Print the whole report so the numbers always surface.
           cat /tmp/ab.txt
           kill "$server" "$backend" 2>/dev/null || true
