@@ -101,45 +101,32 @@ fn reuseport_listener(addr: SocketAddr) -> TcpListener {
     TcpListener::from_std(std_listener).expect("monoio from_std")
 }
 
-/// Serve one connection, keep-alive: handle requests in a loop until the peer
-/// closes or asks to close.
+/// Serve one request per connection, then close. Simple and robust across every
+/// client (HTTP/1.0 and 1.1): no version-dependent keep-alive negotiation to get
+/// wrong. (Connection reuse is a future optimization; it needs request-version
+/// parsing to be safe for HTTP/1.0 peers.)
 async fn serve_connection(
     mut stream: TcpStream,
     router: Arc<OncedRouter>,
     backend: SocketAddr,
 ) -> std::io::Result<()> {
-    loop {
-        let Some(request) = read_request(&mut stream).await? else {
-            return Ok(()); // peer closed
-        };
-        let wants_close = request
-            .header("connection")
-            .map(|c| c.eq_ignore_ascii_case("close"))
-            .unwrap_or(false);
+    let Some(request) = read_request(&mut stream).await? else {
+        return Ok(()); // clean EOF or unparseable
+    };
 
-        let now = now_ms();
-        let to_forward = request.clone();
-        let mut response = router
-            .handle_async(&request, now, move || async move {
-                forward(backend, &to_forward).await
-            })
-            .await;
+    let now = now_ms();
+    let to_forward = request.clone();
+    let response = router
+        .handle_async(&request, now, move || async move {
+            forward(backend, &to_forward).await
+        })
+        .await;
 
-        // Let HTTP/1.1 keep-alive be the default: drop any upstream Connection
-        // header so the socket is reused across requests.
-        response
-            .headers
-            .retain(|(name, _)| !name.eq_ignore_ascii_case("connection"));
-
-        let mut out = Vec::new();
-        write_response(&mut out, &response)?;
-        let (res, _) = stream.write_all(out).await;
-        res?;
-
-        if wants_close {
-            return Ok(());
-        }
-    }
+    let mut out = Vec::new();
+    write_response(&mut out, &response)?;
+    let (res, _) = stream.write_all(out).await;
+    res?;
+    Ok(())
 }
 
 /// Accumulate bytes until a full HTTP request parses. `None` on clean EOF.
