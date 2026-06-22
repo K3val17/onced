@@ -71,7 +71,7 @@ jobs:
           echo "$second" | grep -qi 'Onced-Status: replayed' || { echo "FAIL: retry not replayed"; exit 1; }
           echo "io_uring transport holds exactly-once: created then replayed"
 
-      - name: Throughput benchmark (replay path, io_uring keep-alive)
+      - name: Throughput benchmark (replay path, io_uring, connection-per-request)
         continue-on-error: true
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq apache2-utils >/dev/null
