@@ -99,10 +99,11 @@ jobs:
           curl -s -X POST http://127.0.0.1:8080/charge -H 'Idempotency-Key: bench-key' \
             --data-binary @/tmp/body >/dev/null || true
           echo "=== ApacheBench: replay path over io_uring, keep-alive ==="
-          ab -k -n 100000 -c 64 \
+          ab -k -n 50000 -c 50 \
              -H 'Idempotency-Key: bench-key' \
              -T 'application/x-www-form-urlencoded' \
              -p /tmp/body \
-             http://127.0.0.1:8080/charge 2>&1 \
-             | grep -E 'Requests per second|Time per request|Complete requests|Failed requests|Keep-Alive requests' || true
+             http://127.0.0.1:8080/charge > /tmp/ab.txt 2>&1 || true
+          # Print the whole report so the numbers always surface.
+          cat /tmp/ab.txt
           kill "$server" "$backend" 2>/dev/null || true
