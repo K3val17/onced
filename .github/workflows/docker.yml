@@ -1,0 +1,51 @@
+name: docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t onced:ci .
+
+      - name: Smoke test — container serves /healthz
+        run: |
+          docker run -d --name onced -p 8080:8080 onced:ci
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 http://127.0.0.1:8080/healthz && break
+            sleep 0.3
+          done
+          curl -fsS --max-time 2 http://127.0.0.1:8080/healthz | grep -q ok \
+            && echo "container healthy"
+          docker rm -f onced
+
+      # Publish to GitHub Container Registry on main and tags (not PRs).
+      - name: Log in to GHCR
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag + push
+        if: github.event_name == 'push'
+        run: |
+          IMAGE_LC=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker tag onced:ci "$IMAGE_LC:latest"
+          docker tag onced:ci "$IMAGE_LC:${GITHUB_SHA::12}"
+          docker push "$IMAGE_LC:latest"
+          docker push "$IMAGE_LC:${GITHUB_SHA::12}"

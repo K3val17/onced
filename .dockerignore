@@ -1,0 +1,7 @@
+target
+**/target
+mutants.out
+mutants.out.old
+fuzz/corpus
+fuzz/artifacts
+.git
