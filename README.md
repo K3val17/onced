@@ -95,6 +95,50 @@ cargo test --workspace                                            # 88 tests
 ONCED_SIM_SEEDS=500 ONCED_SIM_STEPS=4000 cargo run -p onced-sim   # extended soak
 ```
 
+## Testing and stress-testing
+
+Try each behavior live with curl, after `cargo run -p onced-gateway`:
+
+```sh
+# created, then replayed (backend hit once across the retry)
+curl -i -X POST localhost:8080/charge -H 'Idempotency-Key: k1' -d 'amount=500'   # Onced-Status: created
+curl -i -X POST localhost:8080/charge -H 'Idempotency-Key: k1' -d 'amount=500'   # Onced-Status: replayed
+# same key, different body -> 422 (never a wrong replay)
+curl -i -X POST localhost:8080/charge -H 'Idempotency-Key: k1' -d 'amount=999'   # HTTP 422
+# liveness and Prometheus metrics
+curl localhost:8080/healthz
+curl localhost:8080/metrics
+```
+
+Two scripts:
+
+```sh
+./examples/demo.sh     # end-to-end exactly-once demo (needs python3 + curl)
+./examples/stress.sh   # stress to the brim: fault-injection soak + throughput bench + live load
+```
+
+Stress it as hard as you like. The deterministic simulation is the real stress: it is
+socket-free, so it runs identically everywhere, and any failure replays from its seed.
+
+```sh
+# ~20 million fault-injected operations (crashes, clock jumps, takeovers, mismatches), both durability modes
+ONCED_SIM_SEEDS=1000 ONCED_SIM_STEPS=10000 cargo run --release -p onced-sim
+
+# raw engine throughput
+cargo run --release -p onced-bench
+
+# prove the tests themselves catch bugs (mutation testing)
+cargo mutants -p onced-core
+
+# fuzz the two untrusted-input parsers (nightly)
+cargo +nightly fuzz run decode_record
+cargo +nightly fuzz run parse_request
+```
+
+Want to understand the hard parts (exactly-once vs delivery, fencing, the WAL, group
+commit, the simulation, sharding, replication, io_uring)? Read
+[`docs/TECH_SPEC.md`](docs/TECH_SPEC.md), an internal deep-dive written to learn from.
+
 ## Dependencies
 
 The core is zero-dependency. `onced-core` (engine, WAL, abuse, sketches), the `onced-gateway` HTTP/1.1 reverse proxy, the simulation harness, and the benchmarks all build with the Rust standard library only. No crates.io downloads, so the correctness-critical code stays auditable, offline-buildable, and supply-chain-clean. `#![forbid(unsafe_code)]` holds in every safe-path crate.
