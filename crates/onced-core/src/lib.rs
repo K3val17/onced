@@ -20,6 +20,7 @@
 
 pub mod abuse;
 pub mod engine;
+pub mod hash;
 pub mod hll;
 pub mod replication;
 pub mod sketch;
