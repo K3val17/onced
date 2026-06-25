@@ -18,11 +18,10 @@
 use crate::http::{Request, Response};
 use onced_core::abuse::{Action, RuleSet, Verdict};
 use onced_core::engine::{Begin, Engine, RunToken};
+use onced_core::hash::hmac_sha256;
 use onced_core::store::Store;
 use onced_core::{CachedOutcome, IdempotencyKey, RequestFingerprint};
-use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 
 /// The backend the gateway protects. Abstracted so the exactly-once and abuse
 /// behaviour can be tested without real sockets.
@@ -114,17 +113,40 @@ pub struct Gateway<S: Store, U: Upstream> {
     rules: RuleSet,
     upstream: U,
     metrics: Metrics,
+    /// 32-byte server key used to produce the HMAC-SHA256 request fingerprint.
+    /// Keying the fingerprint prevents an attacker from crafting a colliding
+    /// request or predicting fingerprints (the SipHash/DefaultHasher it replaced
+    /// was unkeyed and non-cryptographic).
+    fingerprint_key: [u8; 32],
 }
 
 impl<S: Store, U: Upstream> Gateway<S, U> {
-    /// Build a gateway from an engine, a rule set, and a backend.
+    /// Build a gateway from an engine, a rule set, and a backend, using a
+    /// process-derived fingerprint key (all-zeros sentinel which callers should
+    /// replace via [`with_fingerprint_key`] in production).
+    ///
+    /// Existing call sites keep compiling unchanged; the key can be supplied
+    /// after construction with [`with_fingerprint_key`] or threaded through by
+    /// passing a pre-built `Gateway` to the [`Router`].
+    ///
+    /// [`with_fingerprint_key`]: Gateway::with_fingerprint_key
     pub fn new(engine: Engine<S>, rules: RuleSet, upstream: U) -> Self {
         Self {
             engine,
             rules,
             upstream,
             metrics: Metrics::default(),
+            fingerprint_key: [0u8; 32],
         }
+    }
+
+    /// Set the HMAC-SHA256 fingerprint key, consuming `self` and returning the
+    /// configured gateway. Use this (or read from the environment) to supply the
+    /// same key to every shard in a [`Router`] so fingerprints are consistent
+    /// across shards.
+    pub fn with_fingerprint_key(mut self, key: [u8; 32]) -> Self {
+        self.fingerprint_key = key;
+        self
     }
 
     /// A snapshot of the operational counters.
@@ -206,7 +228,7 @@ impl<S: Store, U: Upstream> Gateway<S, U> {
             return BeginPhase::Forward(ForwardTicket { token: None });
         };
         let key = IdempotencyKey(key.to_string());
-        let fingerprint = fingerprint_of(request);
+        let fingerprint = fingerprint_of(request, &self.fingerprint_key);
 
         match self.engine.begin(key, fingerprint, now_ms) {
             Begin::Run(token) => BeginPhase::Forward(ForwardTicket { token: Some(token) }),
@@ -320,19 +342,31 @@ pub(crate) fn metrics_response(metrics: &Metrics) -> Response {
     }
 }
 
-/// 256-bit fingerprint of the meaningful request content (method, target, body),
-/// so a key reused with a different request is detected as a mismatch.
-fn fingerprint_of(request: &Request) -> RequestFingerprint {
-    let mut bytes = [0u8; 32];
-    for (salt, chunk) in bytes.chunks_mut(8).enumerate() {
-        let mut hasher = DefaultHasher::new();
-        (salt as u64).hash(&mut hasher);
-        request.method.hash(&mut hasher);
-        request.target.hash(&mut hasher);
-        request.body.hash(&mut hasher);
-        chunk.copy_from_slice(&hasher.finish().to_le_bytes());
-    }
-    RequestFingerprint(bytes)
+/// 256-bit HMAC-SHA256 fingerprint of the meaningful request content (method,
+/// target, body), keyed with `server_key` so an attacker cannot forge a
+/// colliding fingerprint or predict fingerprints without the key.
+///
+/// The canonical byte string length-prefixes each field (4-byte big-endian
+/// length then the UTF-8/raw bytes), so no two distinct (method, target, body)
+/// triples can produce the same byte string (e.g. method="ab",target="c" is
+/// unambiguously different from method="a",target="bc").
+pub(crate) fn fingerprint_of(request: &Request, server_key: &[u8; 32]) -> RequestFingerprint {
+    // Canonical layout: for each field, emit its length as 4 big-endian bytes,
+    // then the raw bytes. This is unambiguous: the decoder always knows exactly
+    // how many bytes belong to each field.
+    let method = request.method.as_bytes();
+    let target = request.target.as_bytes();
+    let body = &request.body;
+
+    let mut canonical = Vec::with_capacity(3 * 4 + method.len() + target.len() + body.len());
+    canonical.extend_from_slice(&(method.len() as u32).to_be_bytes());
+    canonical.extend_from_slice(method);
+    canonical.extend_from_slice(&(target.len() as u32).to_be_bytes());
+    canonical.extend_from_slice(target);
+    canonical.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    canonical.extend_from_slice(body);
+
+    RequestFingerprint(hmac_sha256(server_key, &canonical))
 }
 
 fn to_outcome(response: &Response) -> CachedOutcome {
@@ -396,13 +430,84 @@ fn bad_gateway() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use crate::gateway::{Gateway, Upstream};
+    use crate::gateway::{fingerprint_of, Gateway, Upstream};
     use crate::http::{Request, Response};
     use onced_core::abuse::{Action, RuleSet};
     use onced_core::engine::Engine;
     use onced_core::store::MemoryStore;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    // --- TDD: keyed cryptographic fingerprint tests ---
+
+    fn req(method: &str, target: &str, body: &[u8]) -> Request {
+        Request {
+            method: method.to_string(),
+            target: target.to_string(),
+            headers: Vec::new(),
+            body: body.to_vec(),
+        }
+    }
+
+    /// Same request, same key => identical fingerprint (deterministic).
+    #[test]
+    fn fingerprint_same_request_same_key_is_deterministic() {
+        let key = [0xABu8; 32];
+        let r = req("POST", "/charge", b"amount=100");
+        assert_eq!(fingerprint_of(&r, &key), fingerprint_of(&r, &key));
+    }
+
+    /// Changing the method changes the fingerprint.
+    #[test]
+    fn fingerprint_different_method_is_different() {
+        let key = [0x01u8; 32];
+        let r1 = req("POST", "/charge", b"amount=100");
+        let r2 = req("PUT", "/charge", b"amount=100");
+        assert_ne!(fingerprint_of(&r1, &key), fingerprint_of(&r2, &key));
+    }
+
+    /// Changing the target changes the fingerprint.
+    #[test]
+    fn fingerprint_different_target_is_different() {
+        let key = [0x02u8; 32];
+        let r1 = req("POST", "/charge", b"amount=100");
+        let r2 = req("POST", "/refund", b"amount=100");
+        assert_ne!(fingerprint_of(&r1, &key), fingerprint_of(&r2, &key));
+    }
+
+    /// Changing the body changes the fingerprint.
+    #[test]
+    fn fingerprint_different_body_is_different() {
+        let key = [0x03u8; 32];
+        let r1 = req("POST", "/charge", b"amount=100");
+        let r2 = req("POST", "/charge", b"amount=999");
+        assert_ne!(fingerprint_of(&r1, &key), fingerprint_of(&r2, &key));
+    }
+
+    /// Length-prefix framing: ("ab","c") and ("a","bc") must not collide.
+    #[test]
+    fn fingerprint_length_prefix_prevents_field_boundary_collision() {
+        let key = [0x04u8; 32];
+        // method="ab", target="c" vs method="a", target="bc" — same concatenated bytes
+        // without length prefixes, different with them.
+        let r1 = req("ab", "c", b"");
+        let r2 = req("a", "bc", b"");
+        assert_ne!(fingerprint_of(&r1, &key), fingerprint_of(&r2, &key));
+        // body boundary too
+        let r3 = req("POST", "abc", b"");
+        let r4 = req("POST", "ab", b"c");
+        assert_ne!(fingerprint_of(&r3, &key), fingerprint_of(&r4, &key));
+    }
+
+    /// Two different server keys yield different fingerprints for the same request
+    /// (proving the MAC is actually keyed).
+    #[test]
+    fn fingerprint_is_keyed_different_key_yields_different_fingerprint() {
+        let key_a = [0xAAu8; 32];
+        let key_b = [0xBBu8; 32];
+        let r = req("POST", "/charge", b"amount=100");
+        assert_ne!(fingerprint_of(&r, &key_a), fingerprint_of(&r, &key_b));
+    }
 
     /// An `Upstream` that counts how many times the backend is actually called.
     struct CountingUpstream {
@@ -453,6 +558,8 @@ mod tests {
                 body: b"charged".to_vec(),
             },
         )
+        // Use a fixed test key so fingerprints are stable across retries.
+        .with_fingerprint_key([0x42u8; 32])
     }
 
     /// THE headline end-to-end guarantee: retrying with the same key hits the
