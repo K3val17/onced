@@ -6,7 +6,7 @@
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    if let Some((consumed, _key, _state)) = onced_core::wal::decode_record(data) {
+    if let Some((consumed, _key, _state, _chain)) = onced_core::wal::decode_record(data) {
         // A successful decode must report a length within the input.
         assert!(consumed <= data.len());
     }

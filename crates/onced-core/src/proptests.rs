@@ -14,7 +14,7 @@
 //! proptest is a dev-dependency, so the shipped library stays zero-dependency.
 
 use crate::sketch::CountMinSketch;
-use crate::wal::{decode_record, encode_record};
+use crate::wal::{decode_record, encode_record, GENESIS};
 use crate::{CachedOutcome, Fence, IdempotencyKey, KeyState, RequestFingerprint};
 use proptest::prelude::*;
 use std::collections::HashMap;
@@ -66,8 +66,8 @@ proptest! {
     /// bytes it produced.
     #[test]
     fn wal_record_round_trips(key in arb_key(), state in arb_keystate()) {
-        let framed = encode_record(&key, &state);
-        let (consumed, decoded_key, decoded_state) =
+        let framed = encode_record(&key, &state, &GENESIS);
+        let (consumed, decoded_key, decoded_state, _chain) =
             decode_record(&framed).expect("a freshly encoded record must decode");
         prop_assert_eq!(consumed, framed.len());
         prop_assert_eq!(decoded_key, key);
@@ -85,7 +85,7 @@ proptest! {
     /// never mistaken for a complete record), and never panics.
     #[test]
     fn wal_decode_rejects_every_truncation(key in arb_key(), state in arb_keystate()) {
-        let framed = encode_record(&key, &state);
+        let framed = encode_record(&key, &state, &GENESIS);
         for n in 0..framed.len() {
             prop_assert!(decode_record(&framed[..n]).is_none(), "prefix len {} decoded", n);
         }
@@ -100,12 +100,12 @@ proptest! {
         flip_byte in any::<prop::sample::Index>(),
         flip_bit in 0u8..8,
     ) {
-        let mut framed = encode_record(&key, &state);
+        let mut framed = encode_record(&key, &state, &GENESIS);
         let i = flip_byte.index(framed.len());
         framed[i] ^= 1 << flip_bit;
         // Either it fails to decode, or (astronomically rare CRC collision) it
         // decodes to the *same* record. It must never decode to a different one.
-        if let Some((_, k, s)) = decode_record(&framed) {
+        if let Some((_, k, s, _chain)) = decode_record(&framed) {
             prop_assert!(k == key && s == state, "corruption decoded to a different record");
         }
     }

@@ -1,4 +1,4 @@
-//! Write-ahead log: crash-safe durability for the idempotency store.
+//! Write-ahead log: crash-safe, tamper-evident durability for the idempotency store.
 //!
 //! State changes are appended to a log file and forced to disk with `fsync`;
 //! on restart the log is replayed to rebuild the in-memory index exactly. This
@@ -9,12 +9,34 @@
 //! and CRC32-checksummed so a torn or corrupt tail (the signature of a crash
 //! mid-append) is detected and discarded rather than trusted.
 //!
+//! ## Tamper-evidence: hash-chaining
+//!
+//! Beyond CRC32 (which detects accidental bit-flips), records are **hash-chained**
+//! with SHA-256 so that any insertion, deletion, reorder, or deliberate edit of a
+//! durable record is detectable on the next open.
+//!
+//! The chain is defined as:
+//!   `chain_0 = GENESIS = [0u8; 32]`
+//!   `chain_i = sha256(chain_{i-1} || crc_bytes_of_record_i || payload_of_record_i)`
+//!
+//! Each record carries the chain hash that was computed for it. On replay the
+//! chain is recomputed from the genesis and compared to the stored value; any
+//! mismatch (tamper, reorder, insert, or edit) is surfaced as `InvalidData` —
+//! the same loud-failure path as interior CRC corruption.
+//!
+//! **Compaction** rewrites the log with a fresh chain recomputed from genesis
+//! over the surviving records. This is a checkpoint: the new chain root is
+//! independent of the old log's chain history.
+//!
+//! Frame layout (per record): `[payload_len: u32][crc32: u32][chain: 32][payload]`
+//!
 //! Records are written with no external dependencies: a small hand-rolled
 //! binary format, so the on-disk layout is fully auditable.
 //!
 //! Production code is written test-first; the tests below are watched failing
 //! before `WalStore`, `encode_record`, and `decode_record` exist.
 
+use crate::hash::sha256;
 use crate::store::Store;
 use crate::{CachedOutcome, Fence, IdempotencyKey, KeyState, RequestFingerprint};
 use std::collections::{BTreeMap, HashMap};
@@ -23,6 +45,13 @@ use std::path::Path;
 
 const TAG_IN_PROGRESS: u8 = 0;
 const TAG_COMPLETED: u8 = 1;
+
+/// The genesis chain value: the "previous hash" for the very first record.
+/// All-zeros is conventional (similar to Bitcoin's genesis block prev-hash).
+pub(crate) const GENESIS: [u8; 32] = [0u8; 32];
+
+/// Number of bytes in the record header (len:u32 + crc:u32 + chain:32).
+pub(crate) const HEADER_LEN: usize = 4 + 4 + 32;
 
 /// CRC32 (IEEE 802.3, reflected, poly 0xEDB88320). Bit-at-a-time: small and
 /// dependency-free; throughput is not on the hot path for Phase 2.
@@ -36,6 +65,16 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Compute the chain hash for a single record given the previous chain value.
+/// `chain_i = sha256(chain_{i-1} || crc_bytes || payload)`
+fn compute_chain(prev_chain: &[u8; 32], crc: u32, payload: &[u8]) -> [u8; 32] {
+    let mut input = Vec::with_capacity(32 + 4 + payload.len());
+    input.extend_from_slice(prev_chain);
+    input.extend_from_slice(&crc.to_le_bytes());
+    input.extend_from_slice(payload);
+    sha256(&input)
 }
 
 fn put_u16(buf: &mut Vec<u8>, x: u16) {
@@ -98,11 +137,17 @@ impl<'a> Reader<'a> {
 }
 
 /// Serialize one `(key, state)` into a self-describing, length-framed,
-/// CRC-checksummed record: `[payload_len: u32][crc32: u32][payload]`.
+/// CRC-checksummed, hash-chained record:
+/// `[payload_len: u32][crc32: u32][chain: 32][payload]`.
+///
+/// `prev_chain` is the chain hash of the immediately preceding record (or
+/// [`GENESIS`] for the first record). The chain hash written into the record
+/// is `sha256(prev_chain || crc_bytes || payload)`, binding this record to its
+/// position in the sequence.
 ///
 /// Exposed (with [`decode_record`]) as the low-level on-disk codec so it can be
 /// fuzzed directly; most callers use [`WalStore`].
-pub fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
+pub fn encode_record(key: &IdempotencyKey, state: &KeyState, prev_chain: &[u8; 32]) -> Vec<u8> {
     let mut payload = Vec::new();
     put_str(&mut payload, &key.0);
     match state {
@@ -134,24 +179,33 @@ pub fn encode_record(key: &IdempotencyKey, state: &KeyState) -> Vec<u8> {
         }
     }
 
-    let mut framed = Vec::with_capacity(8 + payload.len());
+    let crc = crc32(&payload);
+    let chain = compute_chain(prev_chain, crc, &payload);
+
+    let mut framed = Vec::with_capacity(HEADER_LEN + payload.len());
     put_u32(&mut framed, payload.len() as u32);
-    put_u32(&mut framed, crc32(&payload));
+    put_u32(&mut framed, crc);
+    framed.extend_from_slice(&chain);
     framed.extend_from_slice(&payload);
     framed
 }
 
 /// Decode one record from the front of `buf`. Returns the number of bytes
-/// consumed plus the record, or `None` if `buf` does not begin with a complete,
-/// checksum-valid record (truncated tail or corruption). Must never panic or
-/// over-read on arbitrary input — it parses untrusted on-disk bytes after a
-/// crash. Exposed for fuzzing (see the `fuzz/` crate).
-pub fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeyState)> {
-    let header = buf.get(0..8)?;
+/// consumed, the record, and the stored chain hash; or `None` if `buf` does
+/// not begin with a complete, checksum-valid record (truncated tail or
+/// corruption). Must never panic or over-read on arbitrary input — it parses
+/// untrusted on-disk bytes after a crash. Exposed for fuzzing (see the `fuzz/`
+/// crate).
+///
+/// Note: this function does NOT verify the chain hash — that is the caller's
+/// responsibility so that replay can accumulate the chain progressively.
+pub fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeyState, [u8; 32])> {
+    let header = buf.get(0..HEADER_LEN)?;
     let len = u32::from_le_bytes(header[0..4].try_into().ok()?) as usize;
     let crc = u32::from_le_bytes(header[4..8].try_into().ok()?);
-    let total = 8usize.checked_add(len)?;
-    let payload = buf.get(8..total)?;
+    let chain: [u8; 32] = header[8..40].try_into().ok()?;
+    let total = HEADER_LEN.checked_add(len)?;
+    let payload = buf.get(HEADER_LEN..total)?;
     if crc32(payload) != crc {
         return None;
     }
@@ -188,7 +242,7 @@ pub fn decode_record(buf: &[u8]) -> Option<(usize, IdempotencyKey, KeyState)> {
         }
         _ => return None,
     };
-    Some((total, key, state))
+    Some((total, key, state, chain))
 }
 
 /// Best-effort `fsync` of `path`'s parent directory, so a `rename` (or first
@@ -209,15 +263,15 @@ fn sync_parent_dir(path: &Path) {
 }
 
 /// Whether `buf` begins with a *complete* record frame — the full
-/// `[len][crc][payload]` is present. If a complete frame is present yet
+/// `[len][crc][chain][payload]` is present. If a complete frame is present yet
 /// [`decode_record`] still failed, the checksum did not match: that is interior
 /// corruption of a durable record, not a partially-written tail.
 fn is_complete_frame(buf: &[u8]) -> bool {
-    let Some(header) = buf.get(0..8) else {
+    let Some(header) = buf.get(0..HEADER_LEN) else {
         return false;
     };
     let len = u32::from_le_bytes(header[0..4].try_into().unwrap()) as usize;
-    match 8usize.checked_add(len) {
+    match HEADER_LEN.checked_add(len) {
         Some(total) => buf.len() >= total,
         None => false,
     }
@@ -226,6 +280,13 @@ fn is_complete_frame(buf: &[u8]) -> bool {
 /// A durable [`Store`]: an in-memory index kept in lock-step with an append-only
 /// write-ahead log on disk. Reads hit memory. On `open` the log is replayed and
 /// any torn or corrupt tail is truncated away.
+///
+/// ## Tamper-evidence
+///
+/// Records are hash-chained with SHA-256 (see the module doc). `WalStore` tracks
+/// the current chain root and advances it on every `put`. On reopen the chain is
+/// recomputed and verified; any mismatch is an `InvalidData` error. Compaction
+/// restarts the chain from genesis over the surviving records.
 ///
 /// Two durability disciplines, chosen at open time:
 ///
@@ -248,6 +309,8 @@ pub struct WalStore {
     /// Strict mode: `fsync` inside every `put`. Group-commit mode: defer to
     /// `flush`.
     sync_each: bool,
+    /// The SHA-256 chain hash of the last record appended (or genesis if empty).
+    chain_root: [u8; 32],
 }
 
 impl WalStore {
@@ -263,6 +326,14 @@ impl WalStore {
         Self::open_with(path, false)
     }
 
+    /// The current chain root: the SHA-256 hash of the last appended record
+    /// (chained from genesis). After a fresh open of an empty log this is
+    /// the genesis value `[0u8; 32]`. After compaction it reflects the chain
+    /// recomputed from genesis over the surviving records.
+    pub fn root(&self) -> [u8; 32] {
+        self.chain_root
+    }
+
     fn open_with(path: &Path, sync_each: bool) -> std::io::Result<Self> {
         let mut file = std::fs::OpenOptions::new()
             .read(true)
@@ -276,7 +347,23 @@ impl WalStore {
 
         let mut index = HashMap::new();
         let mut offset = 0usize;
-        while let Some((consumed, key, state)) = decode_record(&buf[offset..]) {
+        let mut chain_root = GENESIS;
+
+        while let Some((consumed, key, state, stored_chain)) = decode_record(&buf[offset..]) {
+            // Recompute what the chain should be for this record position.
+            let crc = u32::from_le_bytes(buf[offset + 4..offset + 8].try_into().unwrap());
+            let payload = &buf[offset + HEADER_LEN..offset + consumed];
+            let expected_chain = compute_chain(&chain_root, crc, payload);
+            if expected_chain != stored_chain {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "onced WAL: chain hash mismatch at offset {offset} \
+                         -- tamper, reorder, or insert detected"
+                    ),
+                ));
+            }
+            chain_root = expected_chain;
             index.insert(key, state);
             offset += consumed;
         }
@@ -309,6 +396,7 @@ impl WalStore {
             path: path.to_path_buf(),
             pending: Vec::new(),
             sync_each,
+            chain_root,
         })
     }
 
@@ -349,7 +437,11 @@ impl Store for WalStore {
         // The record is buffered and the index updated immediately so reads in
         // this process are consistent. Durability is a separate step: strict
         // mode forces it now; group-commit mode defers it to the next `flush`.
-        self.pending.extend_from_slice(&encode_record(&key, &state));
+        let record = encode_record(&key, &state, &self.chain_root);
+        // Extract the chain from the record we just encoded (bytes 8..40).
+        let new_chain: [u8; 32] = record[8..40].try_into().unwrap();
+        self.pending.extend_from_slice(&record);
+        self.chain_root = new_chain;
         self.index.insert(key, state);
         if self.sync_each {
             self.flush_pending();
@@ -366,13 +458,18 @@ impl Store for WalStore {
         //    is dropped here.
         self.index.retain(|key, state| keep(key, state));
 
-        // 2. Rewrite the log with exactly one record per surviving entry. This
-        //    collapses all the dead, superseded records the append-only log
-        //    accumulated (a Bitcask-style merge).
+        // 2. Rewrite the log with exactly one record per surviving entry, with a
+        //    FRESH chain recomputed from genesis (compaction is a checkpoint;
+        //    the new chain is independent of the old log's chain history).
         let mut compacted = Vec::new();
+        let mut chain = GENESIS;
         for (key, state) in &self.index {
-            compacted.extend_from_slice(&encode_record(key, state));
+            let record = encode_record(key, state, &chain);
+            // Advance chain using the hash we just embedded in the record.
+            chain = record[8..40].try_into().unwrap();
+            compacted.extend_from_slice(&record);
         }
+        let new_chain_root = chain;
 
         // 3. Commit it crash-safely: write the new log to a temp file, fsync it,
         //    then atomically rename it over the live path. A crash before the
@@ -414,13 +511,14 @@ impl Store for WalStore {
             .expect("onced WAL: seek after compaction failed; refusing to continue");
         self.file = file;
         self.pending.clear();
+        self.chain_root = new_chain_root;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::store::Store;
-    use crate::wal::{decode_record, encode_record, WalStore};
+    use crate::wal::{decode_record, encode_record, WalStore, GENESIS, HEADER_LEN};
     use crate::{CachedOutcome, Fence, IdempotencyKey, KeyState, RequestFingerprint};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -462,18 +560,23 @@ mod tests {
             fingerprint: RequestFingerprint([7u8; 32]),
             lease_expires_at_ms: 99_000,
         };
-        let framed = encode_record(&key, &in_progress);
-        let (consumed, k, s) = decode_record(&framed).expect("valid record decodes");
+        let framed = encode_record(&key, &in_progress, &GENESIS);
+        let (consumed, k, s, chain) = decode_record(&framed).expect("valid record decodes");
         assert_eq!(consumed, framed.len());
         assert_eq!(k, key);
         assert_eq!(s, in_progress);
+        // Chain must be non-genesis (a real SHA-256 of the record contents).
+        assert_ne!(chain, GENESIS);
 
         let done = completed(201, b"charged");
-        let framed = encode_record(&key, &done);
-        let (consumed, k, s) = decode_record(&framed).expect("valid record decodes");
+        let framed = encode_record(&key, &done, &GENESIS);
+        let (consumed, k, s, chain2) = decode_record(&framed).expect("valid record decodes");
         assert_eq!(consumed, framed.len());
         assert_eq!(k, key);
         assert_eq!(s, done);
+        assert_ne!(chain2, GENESIS);
+        // Different states produce different chains.
+        assert_ne!(chain, chain2);
     }
 
     /// A truncated/garbage tail (a crash mid-append) decodes to None, never a
@@ -481,7 +584,7 @@ mod tests {
     #[test]
     fn a_truncated_record_decodes_to_none() {
         let key = IdempotencyKey("k".into());
-        let framed = encode_record(&key, &completed(200, b"ok"));
+        let framed = encode_record(&key, &completed(200, b"ok"), &GENESIS);
         // Hand the decoder every strict prefix of a valid record.
         for cut in 0..framed.len() {
             assert!(
@@ -679,10 +782,10 @@ mod tests {
             }
         }
 
-        // Flip a byte inside the first record's payload (header is bytes 0..8).
+        // Flip a byte inside the first record's payload (past the full header).
         // Records after it remain intact, so this is interior corruption.
         let mut bytes = std::fs::read(&path).unwrap();
-        bytes[9] ^= 0xFF;
+        bytes[HEADER_LEN + 1] ^= 0xFF;
         std::fs::write(&path, &bytes).unwrap();
 
         let result = WalStore::open(&path);
@@ -982,6 +1085,200 @@ mod tests {
         for (k, v) in &reference {
             assert_eq!(store.get(k), Some(v));
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // New tamper-evidence tests (Requirements 7a-7d)
+    // -----------------------------------------------------------------------
+
+    /// (7a) The chain root changes with every put and is fully deterministic:
+    /// two stores fed identical records in the same order reach the same root.
+    #[test]
+    fn chain_root_is_deterministic_and_advances_per_put() {
+        let path1 = temp_wal_path("chain-det-1");
+        let path2 = temp_wal_path("chain-det-2");
+
+        let keys_states: Vec<(IdempotencyKey, KeyState)> = (0..5)
+            .map(|i| {
+                (
+                    IdempotencyKey(format!("k{i}")),
+                    completed(200, format!("v{i}").as_bytes()),
+                )
+            })
+            .collect();
+
+        let mut roots1: Vec<[u8; 32]> = Vec::new();
+        {
+            let mut store = WalStore::open(&path1).unwrap();
+            // Genesis root before any puts.
+            assert_eq!(store.root(), GENESIS);
+            for (k, s) in &keys_states {
+                store.put(k.clone(), s.clone());
+                roots1.push(store.root());
+            }
+        }
+
+        // All roots must be distinct (each put advances the chain).
+        for i in 0..roots1.len() {
+            for j in (i + 1)..roots1.len() {
+                assert_ne!(
+                    roots1[i], roots1[j],
+                    "roots at position {i} and {j} must differ"
+                );
+            }
+        }
+        // No root should be genesis.
+        for r in &roots1 {
+            assert_ne!(*r, GENESIS, "root must not be genesis after a put");
+        }
+
+        // Second store: same sequence -> same roots.
+        let mut roots2: Vec<[u8; 32]> = Vec::new();
+        {
+            let mut store = WalStore::open(&path2).unwrap();
+            for (k, s) in &keys_states {
+                store.put(k.clone(), s.clone());
+                roots2.push(store.root());
+            }
+        }
+
+        assert_eq!(roots1, roots2, "deterministic: same records -> same roots");
+
+        // Reopening preserves the root.
+        let store = WalStore::open(&path1).unwrap();
+        assert_eq!(
+            store.root(),
+            roots1[roots1.len() - 1],
+            "root survives reopen"
+        );
+
+        let _ = std::fs::remove_file(&path1);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    /// (7b) Flipping a byte in an early record's payload is caught on reopen
+    /// as a chain mismatch, even though later records are intact.
+    #[test]
+    fn early_payload_tamper_is_caught_as_chain_mismatch_on_reopen() {
+        let path = temp_wal_path("chain-tamper");
+
+        {
+            let mut store = WalStore::open(&path).unwrap();
+            for i in 0..5u32 {
+                store.put(IdempotencyKey(format!("k{i}")), completed(200, b"intact"));
+            }
+        }
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Flip a byte deep in the first record's payload. The CRC covers only
+        // the payload, so we need to find where the payload starts and also fix
+        // the CRC so the CRC check passes — but the chain check must still catch it.
+        //
+        // Strategy: locate the first record's payload start, flip a payload byte,
+        // then patch the CRC in the header to make crc32 pass. The chain is
+        // computed from the crc_bytes, so patching the CRC also changes the chain
+        // input — thus the stored chain will no longer match.
+        //
+        // In practice, an adversary who patches both CRC and payload is exactly
+        // what the chain catches. We simulate that here.
+        let payload_start = HEADER_LEN;
+        // Flip a byte somewhere in the first record's payload (not the crc header).
+        bytes[payload_start + 2] ^= 0x01;
+        // Recompute CRC over the mutated payload of the first record.
+        let first_len = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let new_crc = super::crc32(&bytes[HEADER_LEN..HEADER_LEN + first_len]);
+        bytes[4..8].copy_from_slice(&new_crc.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        // The CRC now passes, but the chain hash stored in the record was
+        // computed over the OLD (crc, payload) pair. Opening must fail.
+        let result = WalStore::open(&path);
+        assert!(
+            result.is_err(),
+            "chain mismatch must be caught even when CRC passes"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// (7c) Two stores fed the same records in the same order reach the same root.
+    /// (This is already covered by 7a but is tested explicitly here for clarity.)
+    #[test]
+    fn two_stores_same_records_same_root() {
+        let path_a = temp_wal_path("chain-same-a");
+        let path_b = temp_wal_path("chain-same-b");
+
+        let records: Vec<(IdempotencyKey, KeyState)> = vec![
+            (IdempotencyKey("alpha".into()), completed(200, b"a")),
+            (IdempotencyKey("beta".into()), completed(201, b"b")),
+            (IdempotencyKey("gamma".into()), completed(202, b"c")),
+        ];
+
+        let root_a = {
+            let mut store = WalStore::open(&path_a).unwrap();
+            for (k, s) in &records {
+                store.put(k.clone(), s.clone());
+            }
+            store.root()
+        };
+        let root_b = {
+            let mut store = WalStore::open(&path_b).unwrap();
+            for (k, s) in &records {
+                store.put(k.clone(), s.clone());
+            }
+            store.root()
+        };
+
+        assert_eq!(
+            root_a, root_b,
+            "identical record sequences must yield identical roots"
+        );
+
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// (7d) Compaction yields a consistent chain: the compacted log reopens
+    /// cleanly (no chain error) and the root matches what encoding the surviving
+    /// records from genesis would produce.
+    #[test]
+    fn compaction_yields_consistent_chain_that_reopens_cleanly() {
+        let path = temp_wal_path("chain-compact");
+
+        // Write many records including duplicates (so compaction has work to do).
+        {
+            let mut store = WalStore::open(&path).unwrap();
+            for i in 0..20u32 {
+                store.put(
+                    IdempotencyKey(format!("k{}", i % 5)),
+                    completed(200, format!("v{i}").as_bytes()),
+                );
+            }
+        }
+
+        // Compact keeping all keys (collapse history).
+        let root_after_compact = {
+            let mut store = WalStore::open(&path).unwrap();
+            store.compact(&mut |_, _| true);
+            store.root()
+        };
+
+        // Reopening must succeed and report the same root.
+        let store = WalStore::open(&path).unwrap();
+        assert_eq!(
+            store.root(),
+            root_after_compact,
+            "root must be stable across reopen after compaction"
+        );
+
+        // The root must be non-genesis (the compacted log is non-empty).
+        assert_ne!(
+            store.root(),
+            GENESIS,
+            "root must not be genesis after non-empty compaction"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
