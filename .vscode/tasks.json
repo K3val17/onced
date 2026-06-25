@@ -1,0 +1,36 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "green gate (test + clippy + fmt)",
+      "type": "shell",
+      "command": "cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all -- --check",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"]
+    },
+    {
+      "label": "simulation soak (fault injection)",
+      "type": "shell",
+      "command": "ONCED_SIM_SEEDS=500 ONCED_SIM_STEPS=4000 cargo run --release -p onced-sim",
+      "problemMatcher": []
+    },
+    {
+      "label": "throughput bench",
+      "type": "shell",
+      "command": "cargo run --release -p onced-bench",
+      "problemMatcher": []
+    },
+    {
+      "label": "stress to the brim",
+      "type": "shell",
+      "command": "./examples/stress.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "mutation test (onced-core)",
+      "type": "shell",
+      "command": "cargo mutants -p onced-core",
+      "problemMatcher": []
+    }
+  ]
+}

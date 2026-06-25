@@ -1,0 +1,9 @@
+{
+  "recommendations": [
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml",
+    "vadimcn.vscode-lldb",
+    "fill-labs.dependi",
+    "streetsidesoftware.code-spell-checker"
+  ]
+}

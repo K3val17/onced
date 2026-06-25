@@ -6,7 +6,11 @@
 .DS_Store
 *.swp
 .idea/
-.vscode/
+# Ignore personal VSCode files but share the team config (analyzer, tasks).
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
 
 # cargo-mutants output
 /mutants.out

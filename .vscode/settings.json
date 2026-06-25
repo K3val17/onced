@@ -1,0 +1,25 @@
+{
+  "// rust": "Format on save with rustfmt; lint with clippy (matches the green gate).",
+  "editor.formatOnSave": true,
+  "[rust]": {
+    "editor.defaultFormatter": "rust-lang.rust-analyzer"
+  },
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.allTargets": true,
+  "rust-analyzer.cargo.features": [],
+  "// exclude": "Keep heavy/generated dirs out of search and the file tree.",
+  "files.exclude": {
+    "**/target": true,
+    "**/mutants.out": true,
+    "**/mutants.out.old": true,
+    "fuzz/corpus": true,
+    "fuzz/artifacts": true
+  },
+  "search.exclude": {
+    "**/target": true,
+    "**/Cargo.lock": true
+  },
+  "files.watcherExclude": {
+    "**/target/**": true
+  }
+}
